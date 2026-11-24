@@ -40,6 +40,8 @@ protected:
     size_t extra_bytes() const override;
     void load_extra(const uint8_t* src, int64_t pos) override;
     void alloc_caches() override;
+    void rows_coming(int n) override;
+    void reads_done() override;
     void assign_scratch() override;
     // A call of a few tokens keeps a scratch of its own, and a prompt batch's is lent to the expert cache between
     // prompts (Engine::use_scratch()).  Not with the drafter, whose features are a whole call's rows, nor on ROCm on
@@ -191,6 +193,16 @@ private:
     Dev tok_norm_, out_query_;
     int n_head_ = 0, n_kv_ = 0, head_dim_ = 0, n_rel_ = 0, taps_ = 0, blk_ = 0;
     int window_ = 0, ring_ = 0, keep_ = 0;
+    // STRATA_RING_SHRINK=1: each window slot's ring is a reservation of addresses for window_ + rows_ positions, of
+    // which only the first ring_small_ are mapped between prompts (a window of the answer's tokens and the window
+    // before them); a call of more rows maps the rest first (rows_coming()), and end_read() gives it back to the
+    // expert cache (reads_done()).  The rows the next token attends move to their places in the ring of the other
+    // size (ring_resize()).  The addresses stay, and a window layer's recordings are by the ring's size (head_key()).
+    bool ring_vmm_ = false;
+    int ring_big_ = 0, ring_small_ = 0;
+    std::vector<Mapped> ring_maps_;   ///< keys and values of each window slot, in slots_'s order
+    uint8_t* ring_tmp_ = nullptr;     ///< keep_ rows, where ring_resize() puts them on their way
+    void ring_resize(int to);
     int core_start_ = 0, core_end_ = 0, n_pass_ = 1, rank_ = 0;
     int n_unpadded_ = 0;
     float qk_clip_ = 0, rel_clip_ = 0, log_alpha_ = 0, log_floor_ = 1, softcap_ = 0;

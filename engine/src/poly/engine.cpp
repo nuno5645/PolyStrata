@@ -8115,6 +8115,7 @@ void Engine::trim_step_graphs(size_t keep, bool all) {
 void Engine::run(const int32_t* tokens, int n) {
     if (n < 1 || n > rows_) throw std::logic_error("eval takes 1 to max_rows() tokens");
     lock_idle_.store(false, std::memory_order_relaxed);
+    rows_coming(n);
     if (n >= kStageRows) take_prompt();
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
@@ -9161,6 +9162,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     if (n < (n_co > 0 ? 0 : 1) || all > read_rows_)
         throw std::logic_error("read takes 1 to max_read() tokens, co-reads among them");
     lock_idle_.store(false, std::memory_order_relaxed);
+    rows_coming(std::min(all, rows_));   // (its calls take max_rows() rows at most)
     // The cuts of the read's start (take_prompt(), cover(), widen_stage(), carry_take()) owe their uploads to the
     // read's first layer: an expert one of them keeps that a later one takes out is never uploaded.
     struct Owe {

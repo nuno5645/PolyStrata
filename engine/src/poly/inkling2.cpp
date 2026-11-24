@@ -814,15 +814,49 @@ int Inkling2::widest() const { return std::max(n_head_ * head_dim_, 2 * n_embd_)
 // Every application of a layer has caches of its own: a full layer's keep a row a position, a window layer's a
 // ring of the rows a call can read.  The convolutions' past inputs are in state_.
 void Inkling2::alloc_caches() {
-    ring_ = std::min(opt_.max_context, window_ + rows_);
-    keep_ = std::min(window_, ring_);
     const size_t row = kv_row();
+    const size_t grain = std::max<size_t>(grain_, 1);
+    const auto whole = [&](size_t b) { return (b + grain - 1) / grain * grain; };
+    if (ring_maps_.empty()) {
+        ring_big_ = (int) std::min<int64_t>(opt_.max_context, (int64_t) window_ + rows_);
+        static const bool shrink = [] {
+            const char* v = std::getenv("STRATA_RING_SHRINK");
+            return v && v[0] == '1';
+        }();
+        // the small ring: a window of the answer's tokens past the window, and what the last piece of VRAM holds more
+        const int64_t few = (int64_t) window_ + std::max(opt_.window, 16);
+        ring_small_ = (int) std::min<int64_t>(ring_big_, (int64_t) (whole((size_t) few * row) / row));
+        ring_vmm_ = false;
+#if !defined(STRATA_VMM_EQUAL_PIECES) && !defined(STRATA_VMM_RELEASE_WITH_ADDRESSES) && !defined(STRATA_GPU_METAL)
+        // one sequence on one card, the cache in VMM pieces outside a pool, not frozen
+        ring_vmm_ = shrink && vmm_ && !pool_on_ && !split_ && opt_.batch == 0 &&
+                    !freeze_experts_asked_ && ring_small_ < ring_big_ && window_ > 0;
+#endif
+        ring_ = ring_vmm_ ? ring_small_ : ring_big_;
+        if (shrink && !ring_vmm_)
+            std::fprintf(stderr, "strata-poly: STRATA_RING_SHRINK: not here (it needs VMM, the expert cache outside a "
+                                 "pool, one sequence on one card); the window rings stay at %d positions\n", ring_big_);
+    }
+    keep_ = std::min(window_, ring_);
     float* st = state_;
+    size_t ring_at = 0;
     for (Slot& s : slots_) {
         if (!runs(s.il)) continue;
         s.past = st;
         st += past_floats();
-        if (blocks_[(size_t) s.il].swa) {
+        if (blocks_[(size_t) s.il].swa && ring_vmm_) {
+            // reserved for the large ring, mapped for the one there is now (ring_resize() maps and unmaps the rest)
+            for (uint16_t** to : {&s.keys, &s.vals}) {
+                if (ring_at == ring_maps_.size()) {
+                    ring_maps_.emplace_back();
+                    Mapped& m = ring_maps_.back();
+                    vmm_reserve(m, (size_t) ring_big_ * row);
+                    vmm_map(m, (size_t) ring_ * row, SIZE_MAX, "the attention cache");
+                    zero_vram((void*) m.base, m.mapped);
+                }
+                *to = (uint16_t*) ring_maps_[ring_at++].base;
+            }
+        } else if (blocks_[(size_t) s.il].swa) {
             s.keys = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
             s.vals = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
         } else {
@@ -936,8 +970,86 @@ void Inkling2::assign_scratch() {
     }
 }
 
+// STRATA_RING_SHRINK: the window rings to `to` positions.  The rows the next token attends (keep_ positions before
+// pos_) go from their places in the ring as it is to their places in the new one, through ring_tmp_; a larger ring
+// is mapped first, with VRAM the expert cache gives when the card has not that much free (as take_prompt()), and a
+// smaller one gives its pages to the expert cache after (as lend_prompt()).  Only the places change, not a bit.
+void Inkling2::ring_resize(int to) {
+    if (!ring_vmm_ || to == ring_ || to < window_ + 1) return;
+    const size_t row = kv_row();
+    const size_t grain = std::max<size_t>(grain_, 1);
+    const auto whole = [&](size_t b) { return (b + grain - 1) / grain * grain; };
+    const size_t bytes = std::min(whole((size_t) to * row), ring_maps_.empty() ? 0 : ring_maps_[0].reserved);
+    if (up_) ck(cudaStreamSynchronize(cs(up_)), "the attention rings");
+    ck(cudaStreamSynchronize(cs(st_)), "the attention rings");
+    if (to > ring_) {
+        size_t need = 0;
+        for (const Mapped& m : ring_maps_) need += bytes > m.mapped ? bytes - m.mapped : 0;
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        const size_t quarter = (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+        if (exp_ && free_b < need + quarter) shrink_cache(need + quarter - free_b);
+        budget_ -= std::min(budget_, need);
+        for (Mapped& m : ring_maps_) {
+            const size_t had = m.mapped;
+            for (int tries = 0;; ++tries) {
+                try {
+                    vmm_map(m, bytes, SIZE_MAX, "the attention cache");
+                    break;
+                } catch (const std::runtime_error&) {
+                    if (tries >= 4 || !oom_give(bytes - m.mapped + (size_t(64) << 20), "the attention rings")) throw;
+                }
+            }
+            // places no row has been written to yet, zeroed as the first map's are (a tile may read them, masked)
+            if (m.mapped > had) zero_vram((void*) (m.base + had), m.mapped - had);
+        }
+    }
+    if (!ring_tmp_) ring_tmp_ = (uint8_t*) dmalloc((size_t) std::max(keep_, window_) * row, "the attention rings");
+    const int64_t from = std::max<int64_t>(0, pos_ - keep_);
+    for (Mapped& m : ring_maps_) {
+        uint8_t* base = (uint8_t*) m.base;
+        for (int dir = 0; dir < 2; ++dir) {   // out of the old ring, then into the new one
+            const int64_t ring = dir == 0 ? ring_ : to;
+            for (int64_t p = from; p < pos_;) {
+                const int64_t at = p % ring, n = std::min<int64_t>(pos_ - p, ring - at);
+                uint8_t* in_ring = base + (size_t) at * row;
+                uint8_t* in_tmp = ring_tmp_ + (size_t) (p - from) * row;
+                ck(cudaMemcpyAsync(dir == 0 ? in_tmp : in_ring, dir == 0 ? in_ring : in_tmp, (size_t) n * row,
+                                   cudaMemcpyDeviceToDevice, cs(st_)),
+                   "the attention rings");
+                p += n;
+            }
+        }
+    }
+    size_t freed = 0;
+    if (to < ring_) {
+        ck(cudaStreamSynchronize(cs(st_)), "the attention rings");
+        for (Mapped& m : ring_maps_) {
+            const size_t had = m.mapped;
+            vmm_unmap(m, bytes);
+            freed += had - m.mapped;
+        }
+    }
+    ring_ = to;
+    keep_ = std::min(window_, ring_);
+    if (freed) {
+        budget_ += freed;
+        grow_cache(freed, true);
+    }
+}
+
+void Inkling2::rows_coming(int n) {
+    if (ring_vmm_ && ring_ < ring_big_ && n > ring_ - window_) ring_resize(ring_big_);
+}
+
+void Inkling2::reads_done() {
+    if (ring_vmm_ && ring_ > ring_small_) ring_resize(ring_small_);
+}
+
 Inkling2::~Inkling2() {
     if (side_) cudaStreamSynchronize(cs(side_));
+    if (st_) cudaStreamSynchronize(cs(st_));
+    for (Mapped& m : ring_maps_) vmm_free(m);
     for (void* e : {side_go_, side_done_})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     if (side_) cudaStreamDestroy(cs(side_));
@@ -1711,7 +1823,8 @@ int Inkling2::peek_next_layer(int il) const {
 
 // A layer's recordings: one a pass of the core, and for a full layer one a size of the rows it reads.
 int Inkling2::head_key(int il, int n) const {
-    return pass_of(il) * 32 + (blocks_[(size_t) il].swa ? 0 : room_key(n));
+    // (STRATA_RING_SHRINK: a window layer's launches read the ring's size, so each size has recordings of its own)
+    return pass_of(il) * 32 + (blocks_[(size_t) il].swa ? (ring_vmm_ && ring_ != ring_big_ ? 16 : 0) : room_key(n));
 }
 
 // A tail's recordings: one a pass of the core and a sequence, whose state is in them (the heads' are the sequence's

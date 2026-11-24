@@ -345,6 +345,7 @@ public:
         if (stage_lent_) narrow_stage();
         if (carry_lent_) carry_give();
         if (prompt_lends_) lend_prompt();
+        reads_done();
     }
 
     /// Whether the architecture reads pictures.
@@ -546,6 +547,11 @@ protected:
     /// The layers' places in state_, and the attention's caches: a row a position.  Only for the layers this
     /// engine runs (runs()).
     virtual void alloc_caches() = 0;
+    /// A call of n rows is about to go through the layers (run(), a read()'s calls): the architecture's caches make
+    /// room for them where they were made smaller between prompts (Inkling 2's STRATA_RING_SHRINK).
+    virtual void rows_coming(int n) { (void) n; }
+    /// The prompt's reads are done (end_read()): what only a prompt batch's calls need may go to the expert cache.
+    virtual void reads_done() {}
     /// What row_bytes(), save_rows() and load_rows() are for the layers this engine runs.
     virtual size_t card_row_bytes() const = 0;
     virtual void save_card_rows(int64_t first, int64_t n, uint8_t* dst) = 0;
