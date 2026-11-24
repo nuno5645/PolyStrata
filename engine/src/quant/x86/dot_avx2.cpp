@@ -1043,6 +1043,57 @@ void dot_q8_0_q8_0_x4_avx2(int n, float out[4], const void* STRATA_RESTRICT w_ba
     for (int r = 0; r < 4; ++r) out[r] = hsum_float_8(acc[r]);
 }
 
+// (PolyStrata) Four NVFP4 rows against one Q8_0 activation row: x86_dots.inc's dot_nvfp4_q8_0 (its __AVX2__ branch) for
+// each row, the activation's two Q8_0 blocks and their scales loaded once a block for the four.  A row's accumulator
+// takes the same intrinsics on the same values in the same order (the codes' lookups and reordering, the pair sums,
+// the scale products, the two FMAs a block, hsum_float_8): dot_nvfp4_q8_0's bits (poly_cpu_x4_test).  The decode's
+// CPU experts' NVFP4 down (UD-IQ3_XXS blocks 0-19) on an AVX2 CPU without AVX-512.  Opt-in: STRATA_CPU_X4_NVFP4=1.
+void dot_nvfp4_q8_0_x4_avx2(int n, float out[4], const void* STRATA_RESTRICT w_base, size_t row_bytes, const void* STRATA_RESTRICT vy) {
+    assert(n % QK_NVFP4 == 0);
+    const int nb = n / QK_NVFP4;
+    const uint8_t* wb = (const uint8_t*) w_base;
+    const block_nvfp4* rows[4] = {
+        (const block_nvfp4*) (wb + 0 * row_bytes),
+        (const block_nvfp4*) (wb + 1 * row_bytes),
+        (const block_nvfp4*) (wb + 2 * row_bytes),
+        (const block_nvfp4*) (wb + 3 * row_bytes),
+    };
+    const block_q8_0* STRATA_RESTRICT y = (const block_q8_0*) vy;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*) kvalues_fp4);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i q8_01 = _mm256_loadu_si256((const __m256i*) y[2 * ib + 0].qs);
+        const __m256i q8_23 = _mm256_loadu_si256((const __m256i*) y[2 * ib + 1].qs);
+        const float dy0 = h2f(y[2 * ib].d);
+        const float dy1 = h2f(y[2 * ib + 1].d);
+        for (int r = 0; r < 4; ++r) {
+            const block_nvfp4& x = rows[r][ib];
+            const __m128i q4bits_01 = _mm_loadu_si128((const __m128i*) (x.qs + 0));
+            const __m128i q4bits_23 = _mm_loadu_si128((const __m128i*) (x.qs + 16));
+            const __m128i q4_01_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_01, m4b));
+            const __m128i q4_01_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_01, 4), m4b));
+            const __m128i q4_23_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_23, m4b));
+            const __m128i q4_23_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_23, 4), m4b));
+            const __m256i q4_01 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_01_lo, q4_01_hi), _mm_unpacklo_epi64(q4_01_lo, q4_01_hi));
+            const __m256i q4_23 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_23_lo, q4_23_hi), _mm_unpacklo_epi64(q4_23_lo, q4_23_hi));
+            const __m256 p_1 = mul_sum_i8_pairs_float(q4_01, q8_01);
+            const __m256 p_2 = mul_sum_i8_pairs_float(q4_23, q8_23);
+            const float s0 = ue4m3_to_fp32(x.d[0]) * dy0;
+            const float s1 = ue4m3_to_fp32(x.d[1]) * dy0;
+            const float s2 = ue4m3_to_fp32(x.d[2]) * dy1;
+            const float s3 = ue4m3_to_fp32(x.d[3]) * dy1;
+            const __m256 scales01 = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));
+            const __m256 scales23 = _mm256_set_m128(_mm_set1_ps(s3), _mm_set1_ps(s2));
+            acc[r] = _mm256_fmadd_ps(scales01, p_1, acc[r]);
+            acc[r] = _mm256_fmadd_ps(scales23, p_2, acc[r]);
+        }
+    }
+    for (int r = 0; r < 4; ++r) out[r] = hsum_float_8(acc[r]);
+}
+
 }  // namespace avx2
 
 DotRowsFn avx2_dot_rows(Type w) noexcept {
@@ -1083,6 +1134,8 @@ const DotX4Kernel kX4Table[] = {
     ENTRY_X4(Q8_0, Q8_0, q8_0_q8_0),
     ENTRY_X4(Q4_K, Q8_K, q4_K_q8_K),
     ENTRY_X4(IQ4_XS, Q8_K, iq4_xs_q8_K),
+    // (PolyStrata) opt-in (STRATA_CPU_X4_NVFP4=1): dot_nvfp4_q8_0's bits four rows a call
+    {avx2::dot_nvfp4_q8_0_x4_avx2, Type::NVFP4, Type::Q8_0, Arith::Avx2, Isa::Avx2, "avx2_nvfp4_q8_0_x4", nvfp4_x4_on},
 };
 #undef ENTRY_X4
 #undef ENTRY_OPT

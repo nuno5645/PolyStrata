@@ -38,6 +38,8 @@ struct DotX4Kernel {
     Arith arith = Arith::Generic;
     Isa isa = Isa::Scalar;
     const char* name = "";
+    /// Null for one always taken; an opt-in kernel's switch otherwise (dot_x4_kernel() skips it while this returns false).
+    bool (*on)() = nullptr;
 };
 
 /// False for an own kernel turned off by its switch (DotKernel::on).

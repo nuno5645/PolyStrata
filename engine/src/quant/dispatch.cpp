@@ -56,6 +56,14 @@ int collect_acts(Type act, Arith a, const ActKernel** out, int cap) {
 
 }  // namespace
 
+bool nvfp4_x4_on() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_CPU_X4_NVFP4");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
 bool iq3s_own_on() noexcept {
     static const bool on = [] {
         // Only the exact value 0 turns them off (no "off"/"false"); the quant layer has no shared env-flag helper.
@@ -92,7 +100,7 @@ const DotX4Kernel* dot_x4_kernel(Type w, Arith a, Isa max_isa) noexcept {
     for (const DotX4Table& tb : tables) {
         for (int i = 0; i < tb.n; ++i) {
             const DotX4Kernel& k = tb.v[i];
-            if (k.weight == w && k.arith == a && (int) k.isa <= (int) max_isa && isa_ok(k.isa)) {
+            if (k.weight == w && k.arith == a && (int) k.isa <= (int) max_isa && isa_ok(k.isa) && (!k.on || k.on())) {
                 if (!best || (int) k.isa > (int) best->isa) best = &k;
             }
         }

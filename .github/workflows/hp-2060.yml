@@ -24,7 +24,7 @@ jobs:
         include:
           # the engine with the release's flags (tests off: no ggml); the tests in a tree of their own (ggml as their oracle)
           - { kind: engine, tests: 'OFF', targets: 'strata-poly' }
-          - { kind: tests, tests: 'ON', targets: 'poly_mmq_paths_test poly_inkling2_test poly_i8m_shapes_test poly_slots_lanes_test poly_gemm_small_test poly_nvfp4_lanes_test' }
+          - { kind: tests, tests: 'ON', targets: 'poly_mmq_paths_test poly_inkling2_test poly_i8m_shapes_test poly_slots_lanes_test poly_gemm_small_test poly_nvfp4_lanes_test poly_cpu_x4_test' }
     name: ${{ matrix.kind }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -59,11 +59,16 @@ jobs:
           ccache -z
           cmake --build build --target ${{ matrix.targets }} -j "$(nproc)"
           ccache -s | head -12
+      - name: CPU tests (no card needed)
+        if: matrix.kind == 'tests'
+        run: |
+          grep -m1 -o -w 'avx512f\|avx2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          ./build/poly_cpu_x4_test
       - name: Stage tests
         if: matrix.kind == 'tests'
         run: |
           mkdir -p out
-          cp build/poly_mmq_paths_test build/poly_inkling2_test build/poly_i8m_shapes_test build/poly_slots_lanes_test build/poly_gemm_small_test build/poly_nvfp4_lanes_test out/
+          cp build/poly_mmq_paths_test build/poly_inkling2_test build/poly_i8m_shapes_test build/poly_slots_lanes_test build/poly_gemm_small_test build/poly_nvfp4_lanes_test build/poly_cpu_x4_test out/
       - uses: actions/upload-artifact@v4
         if: matrix.kind == 'tests'
         with:

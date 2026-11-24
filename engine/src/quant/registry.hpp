@@ -25,6 +25,9 @@ ActTable generic_act_table() noexcept;   // act_ref.cpp
 /// DotKernel::on of the layer's own IQ3_S kernels (dispatch.cpp): false with STRATA_CPU_IQ3S=0 in the environment (only the exact value 0),
 /// which keeps the ggml ports (the same bits, slower).  Read once.
 bool iq3s_own_on() noexcept;
+/// DotX4Kernel::on of the AVX2 four-row NVFP4 kernel (dispatch.cpp): true with STRATA_CPU_X4_NVFP4=1 only (opt-in while it is
+/// measured; the same bits as the one-row kernel either way).  Read once.
+bool nvfp4_x4_on() noexcept;
 
 #ifdef STRATA_QUANT_X86_TIERS
 DotTable avx_dot_table() noexcept;       // x86/dot_avx.cpp      (Arith::Avx, Isa::Avx1)
