@@ -2105,8 +2105,15 @@ size_t Engine::trim_kv(int64_t end) {
 }
 
 // A card that holds every expert keeps the whole context's rows (load()): nothing would take what they give back.
+// STRATA_KV_EAGER_FREE=1: the rows past this request's `end` go at once, not one request later: a short prompt
+// after a long conversation that it does not continue has their VRAM for its experts from its first token.  The
+// rows it needs it maps again (cover()); none of the rows it reads is touched.
 size_t Engine::trim_card_kv(int64_t end) {
-    const int64_t before = kv_reach_;
+    static const bool eager = [] {
+        const char* v = std::getenv("STRATA_KV_EAGER_FREE");
+        return v && v[0] == '1';
+    }();
+    const int64_t before = eager ? end : kv_reach_;
     kv_reach_ = end;
     if (kv_.empty() || !exp_ || all_cached()) return 0;
     const int64_t rows = kv_rows_for(std::max(end, before));
