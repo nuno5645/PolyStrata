@@ -4473,6 +4473,8 @@ const Stats& Engine::stats() const {
         all_stats_.tail_experts += s.tail_experts;
         all_stats_.ahead_sent += s.ahead_sent;
         all_stats_.ahead_used += s.ahead_used;
+        all_stats_.win_calls += s.win_calls;
+        all_stats_.win_sent += s.win_sent;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -5166,6 +5168,45 @@ void Engine::pool_read(const Layer& L, PoolRead& r) {
            read_file(p + L.gu2(), L.exp_down + r.e * L.d_bytes, L.d_bytes);
 }
 
+// STRATA_WIN_UPLOAD: which of a window's misses go up to the card (moe()).  The distinct misses the mirror holds, the
+// most used first (the first seen first among equals), at most win_upload_ and the own group's slots; of those the
+// largest k whose uploads (k x an expert's bytes at win_gbs_) take no longer than the CPU's share of the others
+// ((distinct - k) x win_cpu_ms_, the CPU's measured time a distinct expert of a window's call).  Before a measure:
+// one, as without it.  Their places in own_e; returns k.
+int Engine::win_pick(const Layer& L, int il, const CpuExpert* host, const int32_t* host_e, int n_host, int32_t* own_e) {
+    int32_t ds[kCpuRows * kMaxUsed];
+    int uses[kCpuRows * kMaxUsed];
+    int nd = 0, distinct = 0;
+    for (int i = 0; i < n_host; ++i) {
+        const int32_t e = host_e[i];
+        int at = 0;
+        while (at < nd && ds[at] != e) ++at;
+        if (at == nd) {
+            ++distinct;
+            if (host[i].gate != mirror(il, e)) continue;   // not from the mirror (a pool slot or the file): stays
+            ds[nd] = e;
+            uses[nd++] = 0;
+        }
+        if (at < nd) ++uses[at];
+    }
+    // the most used first; a stable order among equals
+    int order[kCpuRows * kMaxUsed];
+    for (int i = 0; i < nd; ++i) order[i] = i;
+    std::stable_sort(order, order + nd, [&](int a, int b) { return uses[a] > uses[b]; });
+    const int cap = std::min({win_upload_, ahead_slots_, nd});
+    int k = cap > 0 ? 1 : 0;
+    if (win_cpu_ms_ > 0.f && cap > 1) {
+        const double up_ms = (double) (L.gu2() + L.d_bytes) / (win_gbs_ * 1e6);
+        for (int c = cap; c > 1; --c)
+            if (c * up_ms <= (distinct - c) * (double) win_cpu_ms_) {
+                k = c;
+                break;
+            }
+    }
+    for (int i = 0; i < k; ++i) own_e[i] = ds[order[i]];
+    return k;
+}
+
 // The routed experts of tokens that come a few at a time.  moe_router() is on its way, with ev_ behind it.  True
 // when experts were computed on the CPU: their sum waits in h_cpu_ for moe_add().  `first` is run once, by the
 // thread that hands the cached experts to the card and ahead of them.
@@ -5319,7 +5360,39 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         // waiting for their uploads, and were slower than none.
         // Not while up_ still copies the guesses for this layer or earlier ones: the card would wait for all of them.
         int own = -1;   // that expert, which launch() uploads; -1: none
-        if (aheads && n_host > 0 && at == 0 && !up_busy()) {
+        // STRATA_WIN_UPLOAD=K (a window of several rows): up to K of the misses, the most used first, as many as the
+        // CPU's share of the rest takes as long to compute as their uploads take (win_pick()).  They run on the card
+        // in its cached experts' kernels, their uses after the cached ones as the one expert's above.
+        int own_n = 0, own_e[Ahead::kSlots];
+        if (win_upload_ > 0 && m > 1 && aheads && n_host > 0 && at == 0 && !up_busy()) {
+            own_n = win_pick(L, il, host, host_e, n_host, own_e);
+            if (own_n > 0) {
+                Ahead& g = ahead_[kAheadGroups];
+                uint8_t* slot0 = stage_ + (size_t) kAheadGroups * ahead_slots_ * ahead_stride_;
+                g.il = il;
+                g.n = own_n;
+                std::copy(own_e, own_e + own_n, g.e);
+                own = own_e[0];
+                read |= 1u << kAheadGroups;
+                stats_.ahead_sent += own_n;
+                ++stats_.win_calls;
+                stats_.win_sent += own_n;
+                int kept = 0;
+                for (int i = 0; i < n_host; ++i) {
+                    const int32_t* p = std::find(own_e, own_e + own_n, host_e[i]);
+                    if (p != own_e + own_n) {
+                        cached[n_cached++] = {slot0 + (size_t) (p - own_e) * ahead_stride_, host[i].weight, at + host[i].row,
+                                              host_e[i]};
+                        ++stats_.ahead_used;
+                    } else {
+                        host[kept] = host[i];
+                        host_e[kept++] = host_e[i];
+                    }
+                }
+                n_host = kept;
+            }
+        }
+        if (own_n == 0 && aheads && n_host > 0 && at == 0 && !up_busy()) {
             int best = 0, most = 0;
             for (int i = 0; i < n_host; ++i) {
                 if (host[i].gate != mirror(il, host_e[i])) continue;
@@ -5328,6 +5401,8 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 if (uses > most) best = host_e[i], most = uses;
             }
             if (most > 0) {
+                own_n = 1;
+                own_e[0] = best;
                 Ahead& g = ahead_[kAheadGroups];
                 uint8_t* slot = stage_ + (size_t) kAheadGroups * ahead_slots_ * ahead_stride_;
                 g.il = il;
@@ -5367,12 +5442,13 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const std::function<void()> launch = [&] {
             if (split_) cudaSetDevice(device_);   // one of the experts' threads, which every card's engine shares
             if (first && at == 0) (*first)();
-            if (own >= 0) {   // the miss this call took for the card, up before its experts run
+            if (own >= 0) {   // the miss(es) this call took for the card, up before its experts run
                 const Ahead& g = ahead_[kAheadGroups];
                 ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) g.read, 0), "upload ahead");
-                ck(cudaMemcpyAsync(stage_ + (size_t) kAheadGroups * ahead_slots_ * ahead_stride_, mirror(il, own),
-                                   L.gu2() + L.d_bytes, cudaMemcpyHostToDevice, cs(up_)),
-                   "upload ahead");
+                for (int q = 0; q < own_n; ++q)
+                    ck(cudaMemcpyAsync(stage_ + ((size_t) kAheadGroups * ahead_slots_ + (size_t) q) * ahead_stride_,
+                                       mirror(il, own_e[q]), L.gu2() + L.d_bytes, cudaMemcpyHostToDevice, cs(up_)),
+                       "upload ahead");
                 ck(cudaEventRecord((cudaEvent_t) g.up, cs(up_)), "upload ahead");
                 up_last_ = g.up;
             }
@@ -5380,7 +5456,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             // its uses wait for it.  When every launch waited for it, the card was still busy after the CPU's experts
             // in three calls of four at 6 GB, 43 us on average.  The sums are added in the same order either way.
             int own_at = n_cached;
-            while (own >= 0 && own_at > 0 && cached[own_at - 1].e == own) --own_at;
+            while (own >= 0 && own_at > 0 && std::find(own_e, own_e + own_n, cached[own_at - 1].e) != own_e + own_n) --own_at;
             const size_t ff = (size_t) n_ff_exp_, q8_row = kernels::native_q8_1_bytes(n_ff_exp_);
             // the scratch holds rows_ experts' values, and a launch's down rows stay inside one add_scaled's kSumRows
             const int most = kernels::native_mmvq_slots_wide() ? kSlots : 8;
@@ -5512,7 +5588,16 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         if (n_far > 0) ecard_->finish_into(cpu);
 #endif
         pool_reads_.clear();
-        stats_.cpu_ms += ms_since(t0);
+        const double cpu_call_ms = ms_since(t0);
+        stats_.cpu_ms += cpu_call_ms;
+        if (win_upload_ > 0 && m > 1) {   // win_pick()'s measure: the CPU's time a distinct expert of a window's call
+            int distinct = 0;
+            for (int i = 0; i < n_host; ++i) distinct += std::find(host_e, host_e + i, host_e[i]) == host_e + i;
+            if (distinct > 0) {
+                const float per = (float) (cpu_call_ms / distinct);
+                win_cpu_ms_ = win_cpu_ms_ > 0.f ? 0.9f * win_cpu_ms_ + 0.1f * per : per;
+            }
+        }
     }
     for (int h = 0; read; ++h, read >>= 1)
         if (read & 1u) ck(cudaEventRecord((cudaEvent_t) ahead_[h].read, cs(st_)), "upload ahead");
@@ -6152,6 +6237,14 @@ void Engine::build_mirror() {
         }
     }
     prefetch_k_ = kAheadGuesses;   // moe_router() scores the next layer's router
+    // STRATA_WIN_UPLOAD=K: a window's call uploads up to K of its misses (win_pick()); 0 / unset: one, as before.
+    // STRATA_WIN_UPLOAD_GBS: the bus's speed win_pick() counts on (default 12 GB/s, PCIe 3.0 x16 as measured).
+    if (const char* v = std::getenv("STRATA_WIN_UPLOAD"); v && std::atoi(v) > 0) {
+        win_upload_ = std::min(std::atoi(v), (int) Ahead::kSlots);
+        if (const char* g = std::getenv("STRATA_WIN_UPLOAD_GBS"); g && std::atof(g) > 0) win_gbs_ = std::atof(g);
+        std::fprintf(stderr, "strata-poly: STRATA_WIN_UPLOAD: up to %d of a window's misses go up to the card (%d slots, %.1f GB/s)\n",
+                     win_upload_, ahead_slots_, win_gbs_);
+    }
 #endif
 }
 

@@ -1496,6 +1496,9 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
                  (long long) st.ahead_sent, (long long) st.ahead_used, (long long) st.tail_experts,
                  (long long) r.guessed_right, (long long) r.guessed);
+    if (st.win_calls > 0)
+        std::fprintf(stderr, "STRATA_WIN_UPLOAD: %lld window calls uploaded %lld misses (%.2f a call)\n", (long long) st.win_calls,
+                     (long long) st.win_sent, (double) st.win_sent / (double) st.win_calls);
     return 0;
 }
 

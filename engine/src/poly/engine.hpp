@@ -216,6 +216,7 @@ struct Stats {
     int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, batch_cached = 0, batch_staged = 0;
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
+    int64_t win_calls = 0, win_sent = 0;      ///< STRATA_WIN_UPLOAD: window calls that uploaded misses, and how many
     int64_t ahead_sent = 0, ahead_used = 0;   ///< experts uploaded ahead of their layer (vram_ahead()), and run so
     double cpu_ms = 0, route_wait_ms = 0;
 };
@@ -730,6 +731,7 @@ protected:
     void save_last(uint8_t* dst);
     void moe_router(const Layer& L, int n);
     bool moe(Layer& L, int il, int n, const std::function<void()>* first = nullptr);
+    int win_pick(const Layer& L, int il, const CpuExpert* host, const int32_t* host_e, int n_host, int32_t* own_e);
     bool card_moe(int n);
     bool moe_card(Layer& L, int il, int n);
     /// Whether n tokens take layer L's routed experts as a prompt batch, through MMQ (moe_rows()), and not a few at
@@ -934,6 +936,9 @@ protected:
     static constexpr int kAheadGroups = 6, kAheadGuesses = 4;
     Ahead ahead_[kAheadGroups + 1];   ///< and last, the misses a call uploads for itself (moe())
     int ahead_turn_ = 0, ahead_slots_ = 0;
+    int win_upload_ = 0;          ///< STRATA_WIN_UPLOAD: the most misses a window's call uploads (moe(), win_pick())
+    float win_cpu_ms_ = 0.f;      ///< the CPU's time a distinct expert of a window's call, measured (moving average)
+    double win_gbs_ = 12.0;       ///< the bus's speed win_pick() counts on (STRATA_WIN_UPLOAD_GBS)
     void* up_last_ = nullptr;   ///< the `up` of the last uploads ahead put on up_
     size_t ahead_stride_ = 0;
     std::atomic<bool> map_quit_{false};
