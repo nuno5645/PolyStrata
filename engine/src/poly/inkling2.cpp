@@ -253,6 +253,13 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_PRESTAGE");
         prestage_ = v && std::string(v) == "1";
     }
+    // A read's cuts take the experts a short answer left on their way into the cache as uploaded, and upload the
+    // ones they keep after the last of them (Engine::owe_refills()).  The same experts end in the cache.
+    // hp-2060: opt-in (STRATA_INK_OWE=1) while it is a branch of okada-shogo's and not a PR
+    {
+        const char* v = std::getenv("STRATA_INK_OWE");
+        owes_ = v && std::string(v) == "1";
+    }
 #endif
     // a prompt batch's F32 products of 33 to 256 outputs (the controllers' down products, the routers) in
     // gemm_f32_tiles(): the same bits as gemm_f32()
