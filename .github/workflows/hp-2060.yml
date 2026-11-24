@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: hp-2060-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
