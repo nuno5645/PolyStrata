@@ -41,6 +41,10 @@ struct MetaValue;
 
 namespace strata::poly {
 
+// window()'s tokens at most: 8, or up to 16 with STRATA_WINDOW_MAX (Engine::load(); a long repeat of the conversation
+// checked in one window).  The arrays a window's size indexes are this long.
+constexpr int kWindowMost = 16;
+
 class Shards;
 struct Likeliest;
 
@@ -1230,7 +1234,7 @@ protected:
     // the last token of the sequence, and the outputs of the tokens of the call under way follow it.
     float* hn_ = nullptr;
     Likeliest* h_guess_ = nullptr;   ///< a guess and its probability, pinned
-    int32_t win_tok_[8] = {};           ///< the window's tokens, for keep()
+    int32_t win_tok_[kWindowMost] = {}; ///< the window's tokens, for keep()
     int64_t ahead_pos_ = -1;            ///< draft() has left the block's row of this position as its token leaves it,
     int32_t ahead_tok_ = 0;             ///< which is this one
     float* snap_ = nullptr;      ///< window(): the recurrent state after tokens of it (snap_tokens()), rec_n_ apart
@@ -1256,9 +1260,9 @@ protected:
         double ms = 0;           ///< what a window took this way, the later ones counting for more
         int n = 0;               ///< how many were timed
     };
-    Way way_[2][9];              ///< [in halves][the window's tokens]
-    int way_calls_[9] = {};      ///< windows of each size since the way behind had one
-    int way_backoff_[9] = {};    ///< the way behind waits kWayAgain << this many windows of the size
+    Way way_[2][kWindowMost + 1];              ///< [in halves][the window's tokens]
+    int way_calls_[kWindowMost + 1] = {};      ///< windows of each size since the way behind had one
+    int way_backoff_[kWindowMost + 1] = {};    ///< the way behind waits kWayAgain << this many windows of the size
     bool halves_ = false;        ///< the way of the window under way
     float *wlogits_ = nullptr, *h_wlogits_ = nullptr;   ///< a window's logits, token after token: VRAM and pinned
     uint8_t* h_state_ = nullptr;   ///< pinned: save_state()'s way to its caller's memory, and read()'s checkpoints'

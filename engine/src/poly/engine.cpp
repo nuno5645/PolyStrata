@@ -3898,8 +3898,17 @@ void Engine::load(const Options& o) {
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
     if (opt_.expert_swaps < -1 || opt_.expert_swaps > 64)
         throw std::runtime_error("0 to 64 experts can be on their way into the cache at a time (-1: the default)");
-    if (opt_.window < 0 || opt_.window > 8)
-        throw std::runtime_error("a window is 1 to 8 tokens, or 0 for the model's own");
+    // STRATA_WINDOW_MAX=9..16 (off by default: 8): --window takes up to that many, for repeats of the conversation
+    // (prompt lookup) checked in one window.  A window under kStageRows still takes the few-token paths, each row
+    // the bits it gets alone, so the answer is the same.
+    static const int window_most = [] {
+        const char* v = std::getenv("STRATA_WINDOW_MAX");
+        const int w = v ? std::atoi(v) : 0;
+        return w > 8 ? std::min(w, kWindowMost) : 8;
+    }();
+    if (opt_.window < 0 || opt_.window > window_most)
+        throw std::runtime_error("a window is 1 to " + std::to_string(window_most) +
+                                 " tokens (STRATA_WINDOW_MAX up to 16), or 0 for the model's own");
     if (opt_.lock_experts && opt_.ram_experts_mib >= 0)
         throw std::runtime_error("--lock-experts locks every expert outside VRAM in RAM, so it does not go with "
                                  "--ram-experts-mib");
