@@ -2096,6 +2096,15 @@ int main(int argc, char** argv) {
         setenv("STRATA_SLOTS_WARP", "1", 0);
 #endif
     }
+    // STRATA_POLY_MMVQ_IL=1: the interleaved MMVQ kernels for a window's products (Engine::lin_raw()), which the library
+    // runs on Turing only with STRATA_SM75_IL (kIlRows_75, kIlRows58_75): on, unless it is set
+    if (strata::poly::Engine::mmvq_il_on() && !std::getenv("STRATA_SM75_IL")) {
+#ifdef _WIN32
+        _putenv_s("STRATA_SM75_IL", "1");
+#else
+        setenv("STRATA_SM75_IL", "1", 0);
+#endif
+    }
 #endif
     Options o;
     CacheFlags cache;

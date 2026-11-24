@@ -4950,8 +4950,20 @@ constexpr IlRows58 kIlRows58_70[] = {   // V100-SXM2-16GB (200W/1020MHz, two run
     {14, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q6_K
     {11, {{0, 1, 2, 1, 1}, {1, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {1, 2, 1, 1, 1}}},   // Q3_K
 };
+// Turing (sm_75), from upstream Strata PR 5137 (kIlRows58_75: MMVQ_IL_TMIN=5 mmvq_il_parity --bench --emit-table, three
+// runs on a CMP 50HX; Q5_K 2560x12288 at 5 columns 141.9 -> 89.3 us).  Only with STRATA_SM75_IL=1 / STRATA_SM75_PERF=1
+// (il_arch_ok); bitwise native_mmvq's output as every table here.  The PR's 4-column planes of the copy (IQ4_XS) are not
+// taken: the K-quant kernels read the block-major copy, which they leave as it is.
+constexpr IlRows58 kIlRows58_75[] = {
+    {23, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // IQ4_XS
+    {12, {{0, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 2, 2, 2, 2}, {1, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 2, 2, 2, 2}}},   // Q6_K
+    {11, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q3_K
+};
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
 constexpr Il58Arch kIl58Arch[] = {
+    {75, kIlRows58_75, sizeof(kIlRows58_75) / sizeof(IlRows58)},
     {70, kIlRows58_70, sizeof(kIlRows58_70) / sizeof(IlRows58)},
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
     {120, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},

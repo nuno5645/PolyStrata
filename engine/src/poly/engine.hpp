@@ -362,6 +362,7 @@ public:
     /// the guesses can be checked, and keep(n) makes the first n tokens part of the sequence and forgets the rest.
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
+    static bool mmvq_il_on();   ///< STRATA_POLY_MMVQ_IL=1: lin_raw()'s windows on the interleaved MMVQ kernels
     void window(const int32_t* tokens, int t);
     const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
     /// The next step() leaves its rows' most likely tokens (picked()) on the host in place of their scores, which
@@ -1279,6 +1280,7 @@ protected:
     float *g_ = nullptr, *u_ = nullptr, *h_ = nullptr, *d_ = nullptr, *rl_ = nullptr,
           *logits_ = nullptr;
     void *xq_ = nullptr, *q8_ = nullptr;
+    void* xil_ = nullptr;   ///< STRATA_POLY_MMVQ_IL: the interleaved copy of 2 to 8 tokens' q8_1 blocks (lin_raw())
 
     // pinned host buffers
     float *h_r_ = nullptr, *h_rl_ = nullptr, *h_x_ = nullptr, *h_cpu_ = nullptr, *h_logits_ = nullptr;

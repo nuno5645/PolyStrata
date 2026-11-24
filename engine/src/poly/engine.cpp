@@ -4543,6 +4543,11 @@ void Engine::alloc() {
     const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
     xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
     q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    // STRATA_POLY_MMVQ_IL=1 (off by default): a window's few-token products of IQ4_XS and K-quant matrices on the
+    // interleaved MMVQ kernels where the card has a table for them (lin_raw()); their copy of the tokens' blocks
+    if (mmvq_il_on()) xil_ = dmalloc(kernels::native_q8_1_il_bytes((q_max + 255) / 256 * 256, 8), "scratch");
+#endif
 
     h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
     const size_t at_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s tokens, step()'s
@@ -5334,9 +5339,30 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
     }
     // a launch takes up to 8 tokens, and each comes out as it would alone
     const size_t token = kernels::native_q8_1_bytes(w.n_in);
-    for (int at = 0; at < n; at += 8)
-        kernels::native_mmvq((int) w.type, w.p, (const uint8_t*) xq + (size_t) at * token,
-                             y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st_);
+    for (int at = 0; at < n; at += 8) {
+        const int m = std::min(8, n - at);
+        const uint8_t* xa = (const uint8_t*) xq + (size_t) at * token;
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+        // STRATA_POLY_MMVQ_IL: 2 to 8 tokens on the interleaved kernels, which read a position of every token in one
+        // load; bitwise native_mmvq's output (mmvq_il_parity, T 1-8).  On Turing the library's table is
+        // STRATA_SM75_IL's (main() sets it): kIlRows_75 for 2-4 tokens, kIlRows58_75 for 5-8.
+        if (xil_ && m >= 2 && kernels::native_mmvq_il_supported((int) w.type, m, w.n_out)) {
+            kernels::native_q8_1_interleave(xa, xil_, w.n_in, m, st_);
+            kernels::native_mmvq_il((int) w.type, w.p, xa, xil_, y + (size_t) at * w.n_out, w.n_in, w.n_out, m, st_);
+            continue;
+        }
+#endif
+        kernels::native_mmvq((int) w.type, w.p, xa, y + (size_t) at * w.n_out, w.n_in, w.n_out, m, st_);
+    }
+}
+
+// STRATA_POLY_MMVQ_IL=1 (read once)
+bool Engine::mmvq_il_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_POLY_MMVQ_IL");
+        return v && v[0] == '1';
+    }();
+    return on;
 }
 
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
