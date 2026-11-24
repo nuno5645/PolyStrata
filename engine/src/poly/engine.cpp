@@ -3735,7 +3735,14 @@ void Engine::follow(int written) {
         n_free += s.at.load() == Swap::kFree;
     }
     if (written <= 0) return;
-    const float keep = std::exp2(-(float) written / (float) kSwapHalf);
+    // STRATA_SWAP_HALF=N (off by default: kSwapHalf, 128): the uses' half-life in written tokens.  okada-shogo/PolyStrata
+    // 7030c070f took 32 for Inkling 2 (an RTX 2070's replay of an answer, IQ4_NL: 80.7% -> 82.3% of the experts in VRAM).
+    static const int swap_half = [] {
+        const char* v = std::getenv("STRATA_SWAP_HALF");
+        const int h = v ? std::atoi(v) : 0;
+        return h >= 1 && h <= 65536 ? h : kSwapHalf;
+    }();
+    const float keep = std::exp2(-(float) written / (float) swap_half);
     for (float& r : recent_) r *= keep;
     const auto from_pool = [&](Swap& s) {   // the slot follow_loop() copies s from, held until s arrives
         s.from = -1;
