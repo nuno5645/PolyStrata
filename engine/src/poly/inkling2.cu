@@ -909,8 +909,9 @@ __global__ void ink_conv_add_rows_kernel(const float* x, InkStateRows state, con
                 norm, c);
 }
 
-// BELL: ink_moe_bell_conv_add()'s, bell_add_kernel's wait and sum between the experts' sum and the convolution
-template <bool BELL>
+// BELL: ink_moe_bell_conv_add()'s, bell_add_kernel's wait and sum between the experts' sum and the convolution; 2 with
+// STRATA_BELL_LEAN (bell_lean()): the thread that saw the answer fences, not every thread
+template <int BELL>
 __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const float* __restrict__ scale,
                                         const int* ids, int n_used,
                                         float* fo, float* state, const float* __restrict__ cw, float* __restrict__ out,
@@ -929,14 +930,16 @@ __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const fl
     if (BELL) {
         const uint32_t r = seq[1];
         if (r != 0) {
-            if (threadIdx.x == 0)
+            if (threadIdx.x == 0) {
                 while (bell->ack != r && !bell->abort) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
                     __nanosleep(500);
 #endif
                 }
+                if (BELL == 2) __threadfence_system();
+            }
             __syncthreads();
-            __threadfence_system();
+            if (BELL != 2) __threadfence_system();
             if (i < channels) f = f + *(volatile const float*) (hy + i);
         }
         if (i >= channels) return;
@@ -3045,7 +3048,7 @@ void ink_moe_conv_add(const float* x, const float* w, const float* scale, const 
                       void* stream) {
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_moe_conv_add: 2 to 8 taps");
     const float norm = 1.0f / std::sqrt((float) (taps + 1));
-    launch_pdl(ink_moe_conv_add_kernel<false>, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w,
+    launch_pdl(ink_moe_conv_add_kernel<0>, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w,
                scale, ids, n_used, fo, state, cw, out, acc, a, channels, taps, norm, (const ExpertBell*) nullptr,
                (const uint32_t*) nullptr, (const float*) nullptr);
     launched("ink_moe_conv_add");
@@ -3056,8 +3059,10 @@ void ink_moe_bell_conv_add(const float* x, const float* w, const float* scale, c
                            float* out, float* acc, float a, int channels, int taps, void* stream) {
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_moe_bell_conv_add: 2 to 8 taps");
     const float norm = 1.0f / std::sqrt((float) (taps + 1));
-    launch_pdl(ink_moe_conv_add_kernel<true>, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w,
-               scale, ids, n_used, fo, state, cw, out, acc, a, channels, taps, norm, bell, seq, hy);
+    auto* const kernel = bell_lean() ? &ink_moe_conv_add_kernel<2> : &ink_moe_conv_add_kernel<1>;
+    launch_pdl(kernel, dim3(grid((size_t) channels, 256)),
+               dim3(256), 0, cs(stream), x, w, scale, ids, n_used, fo, state, cw, out, acc, a, channels, taps, norm, bell,
+               seq, hy);
     launched("ink_moe_bell_conv_add");
 }
 

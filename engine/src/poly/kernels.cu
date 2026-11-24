@@ -4498,7 +4498,7 @@ void far_pull(const FarFetch* fetch, const int* count, int most, size_t bytes, v
 __device__ __forceinline__ void bell_ring_block(const void* const* __restrict__ slots, const int32_t* ids,
                                                 const float* w, int n_used, int skip_from, int layer,
                                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell,
-                                                uint32_t* seq) {
+                                                uint32_t* seq, bool lean) {
     __shared__ int jobs;
     if (threadIdx.x == 0) {
         int j = 0;
@@ -4516,30 +4516,33 @@ __device__ __forceinline__ void bell_ring_block(const void* const* __restrict__ 
         return;
     }
     for (int i = threadIdx.x; i < n; i += blockDim.x) hx[i] = x[i];
-    __threadfence_system();   // the input and the jobs are the host's before the ring
+    if (!lean) __threadfence_system();   // the input and the jobs are the host's before the ring
     __syncthreads();
     if (threadIdx.x == 0) {
         bell->layer = layer;
         bell->n = jobs;
+        // lean: this one fence, after the barrier, orders every thread's input before the ring (a fence is cumulative
+        // over what the barrier ordered before it: the PTX memory model, sm_70 on)
         __threadfence_system();
         const uint32_t s = ++seq[0];
         bell->ring = s;
-        __threadfence_system();
-        seq[1] = s;
+        if (!lean) __threadfence_system();
+        seq[1] = s;   // the card's own memory, for the launch after it on the stream
     }
 }
 
 __global__ void bell_ring_kernel(const void* const* __restrict__ slots, const int32_t* __restrict__ ids,
                                  const float* __restrict__ w, int n_used, int skip_from, int layer,
-                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq) {
-    bell_ring_block(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
+                                 const float* __restrict__ x, float* hx, int n, ExpertBell* bell, uint32_t* seq,
+                                 bool lean) {
+    bell_ring_block(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq, lean);
 }
 
 // route_ring(): the first warp routes the token, its lanes count their picks, then the block rings the bell with them
 template<int PER>
 __global__ void route_ring_kernel(const float* __restrict__ logits, int n_expert, int n_used, int gate,
                                   float in_scale, const float* __restrict__ bias, const float* __restrict__ escale,
-                                  bool norm, float w_scale, int32_t* ids, float* w, BellRing r) {
+                                  bool norm, float w_scale, int32_t* ids, float* w, BellRing r, bool lean) {
     if (threadIdx.x < WARP) {
         int id;
         float v;
@@ -4551,29 +4554,43 @@ __global__ void route_ring_kernel(const float* __restrict__ logits, int n_expert
         }
     }
     __syncthreads();   // the picks are the block's
-    bell_ring_block(r.slots, ids, w, n_used, r.skip_from, r.layer, r.x, r.hx, r.n, r.bell, r.seq);
+    bell_ring_block(r.slots, ids, w, n_used, r.skip_from, r.layer, r.x, r.hx, r.n, r.bell, r.seq, lean);
 }
 
 // One block: one thread asks the bell every half microsecond or so, the others sleep at the barrier (a spinning card
 // draws power that a laptop's CPU, computing the experts meanwhile, would rather have).
 __global__ void bell_add_kernel(const ExpertBell* bell, const uint32_t* __restrict__ seq, const float* hy,
-                                float* __restrict__ acc, int n) {
+                                float* __restrict__ acc, int n, bool lean) {
     const uint32_t s = seq[1];
     if (s == 0) return;
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
         while (bell->ack != s && !bell->abort) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             __nanosleep(500);
 #endif
         }
+        if (lean) __threadfence_system();   // lean: the thread that saw the answer fences; the barrier hands it on
+    }
     __syncthreads();
-    __threadfence_system();
+    if (!lean) __threadfence_system();
     for (int i = threadIdx.x; i < n; i += blockDim.x) acc[i] += *(volatile const float*) (hy + i);
+}
+
+// STRATA_BELL_LEAN=1 (off by default): one system fence where the bell rings (thread 0's, after the block's barrier) and
+// one where its answer is seen, in place of one in every thread (merbanan/Strata 5457acc62, 71132109b: k_dp_plan 22.5
+// -> 13.8 us a layer visit on an RTX 2060 SUPER).  The same values are read and added in the same order.
+bool bell_lean() {
+    static const bool lean = [] {
+        const char* v = std::getenv("STRATA_BELL_LEAN");
+        return v && v[0] == '1';
+    }();
+    return lean;
 }
 
 void bell_ring(const void* const* slots, const int32_t* ids, const float* w, int n_used, int skip_from, int layer,
                const float* x, float* hx, int n, ExpertBell* bell, uint32_t* seq, void* stream) {
-    bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq);
+    bell_ring_kernel<<<1, 256, 0, cs(stream)>>>(slots, ids, w, n_used, skip_from, layer, x, hx, n, bell, seq,
+                                                bell_lean());
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("bell_ring: ") + cudaGetErrorString(e));
 }
@@ -4585,7 +4602,7 @@ void route_ring(const float* logits, int n_expert, int n_used, int gate, float i
         throw std::invalid_argument("route_ring: more than 512 experts, or more than 32 a token");
     const auto launch = [&](auto kernel) {
         kernel<<<1, 256, 0, cs(stream)>>>(logits, n_expert, n_used, gate, in_scale, bias, escale, norm, w_scale, ids,
-                                          w, r);
+                                          w, r, bell_lean());
     };
     if (n_expert <= 2 * WARP) launch(route_ring_kernel<2>);
     else if (n_expert <= 4 * WARP) launch(route_ring_kernel<4>);
@@ -4596,7 +4613,7 @@ void route_ring(const float* logits, int n_expert, int n_used, int gate, float i
 }
 
 void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream) {
-    bell_add_kernel<<<1, 512, 0, cs(stream)>>>(bell, seq, hy, acc, n);
+    bell_add_kernel<<<1, 512, 0, cs(stream)>>>(bell, seq, hy, acc, n, bell_lean());
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("bell_add: ") + cudaGetErrorString(e));
 }

@@ -365,6 +365,9 @@ struct BellRing {
 void route_ring(const float* logits, int n_expert, int n_used, int gate, float in_scale, const float* bias,
                 const float* escale, bool norm, float w_scale, int32_t* ids, float* w, const BellRing& r,
                 void* stream);
+/// STRATA_BELL_LEAN=1 (read once; off by default): the bell's kernels fence the system in one thread where they ring
+/// and where they see the answer, not in every thread (the same values read and added in the same order).
+bool bell_lean();
 /// Where seq[1] is a ring: wait until the bell's ack is that ring (or abort is set), then acc += hy (n floats).
 void bell_add(const ExpertBell* bell, const uint32_t* seq, const float* hy, float* acc, int n, void* stream);
 /// copy2() with a third run.  CUDA and HIP only.
