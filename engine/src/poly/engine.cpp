@@ -9582,8 +9582,17 @@ void Engine::window(const int32_t* tokens, int t) {
     output_rows(0, t, h);
     lin(output_, h, wlogits_, t);
     finish_logits(wlogits_, t);
-    ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
-       "logits");
+    // window_picks(): each row's most likely token, the lowest id of the largest score as most_likely() picks it
+    picks_ = std::exchange(win_picks_, false) && d_picks_;
+    if (picks_) {
+        likeliest_rows(wlogits_, n_vocab_, t, d_picks_, st_);
+        ck(cudaMemcpyAsync(h_picks_, d_picks_, (size_t) t * sizeof(Likeliest), cudaMemcpyDeviceToHost, cs(st_)),
+           "logits");
+    } else {
+        ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
+                           cs(st_)),
+           "logits");
+    }
     ck(cudaStreamSynchronize(cs(st_)), "window");
     if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
     recorded_ = recorded_ || recorded;

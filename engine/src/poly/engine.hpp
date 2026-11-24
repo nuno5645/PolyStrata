@@ -377,6 +377,12 @@ public:
         if (next_) next_->eval_picks();
         else eval_picks_ = true;
     }
+    /// The same for the next window() (STRATA_WIN_PICKS=1, main()): picked(i) is the most likely token after its i-th
+    /// token, and logits_of() are not copied to the host (a window of 8 of Inkling 2's is 6.4 MB to copy and to search).
+    void window_picks() {
+        if (next_) next_->window_picks();
+        else win_picks_ = true;
+    }
     void keep(int n);
 
     /// Some files carry a block that guesses ahead: one layer that takes a token and the model's output for the
@@ -1250,6 +1256,7 @@ protected:
     Likeliest *d_picks_ = nullptr, *h_picks_ = nullptr;   ///< step_picks()'s, on the card and pinned
     bool step_picks_ = false, picks_ = false;            ///< asked for the next step(); what the last one left
     bool eval_picks_ = false;                            ///< asked for the next eval()
+    bool win_picks_ = false;                             ///< asked for the next window()
     void draft_rows_of(const Row* rows, const int32_t* tokens, int n, Likeliest* out);
     std::vector<int> step_seqs_, step_rows_;   ///< the sequences of the step, and how many rows each had
     std::vector<int32_t> step_tok_;            ///< each sequence's token and guess, two places a sequence

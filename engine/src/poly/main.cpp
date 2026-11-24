@@ -613,13 +613,22 @@ struct Session {
                 }
                 w[0] = t;
                 if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                // STRATA_WIN_PICKS=1: a greedy window's picks are the card's (window_picks()), as a token's are
+                // (eval_picks()): its rows' scores stay on the card
+                static const bool win_picks = [] {
+                    const char* v = std::getenv("STRATA_WIN_PICKS");
+                    return v && v[0] == '1';
+                }();
+                const bool on_card = win_picks && card_picks;
+                if (on_card) engine.window_picks();
                 engine.window(w, use.t);
+                const auto pick_at = [&](int i) { return on_card ? engine.picked(i) : pick(engine.logits_of(i)); };
                 // logits_of(i) is what follows w[i].  A guess that is what was picked has been through the model
                 // already; the token an answer ends with is shown and never fed, as without guesses.
                 int right = 0;
                 bool more = true;
-                t = pick(engine.logits_of(0));
-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                t = pick_at(0);
+                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick_at(++right);
                 engine.keep(right + 1);
                 kept.read(w, right + 1);
                 r.guessed += use.t - 1;
