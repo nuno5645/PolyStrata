@@ -144,7 +144,7 @@ private:
     // experts' sum comes in after the card's
     bool moe_sum_later(int n) const override { return n == 1 && whole_rec_ && !bell_; }
     bool bells() const override { return true; }
-#if !defined(STRATA_GPU_METAL)
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
     void load_kernels() override;
 #endif
 #if defined(STRATA_USE_HIP)
