@@ -290,19 +290,29 @@ __device__ __forceinline__ void mix_row(const MixArgs& a, int n_embd) {
     if (tid < a.nq) {
         const int j = tid;
         const float sc = 1.0f / sqrtf((float) n_embd);
+        // (the loops unrolled over kMax with s < a.n inside, so v[] and inv[] stay in registers: over a.n they were a
+        // local array; the same steps in the same order)
         float v[InkStates::kMax], inv[InkStates::kMax];
         float m = -INFINITY;
-        for (int s = 0; s < a.n; ++s) {
-            inv[s] = 1.0f / sqrtf(whole[s * kMixSums] / (float) n_embd + 1e-6f);
-            v[s] = whole[s * kMixSums + 1 + j] * inv[s] * sc;
-            m = fmaxf(m, v[s]);
+#pragma unroll
+        for (int s = 0; s < InkStates::kMax; ++s) {
+            if (s < a.n) {
+                inv[s] = 1.0f / sqrtf(whole[s * kMixSums] / (float) n_embd + 1e-6f);
+                v[s] = whole[s * kMixSums + 1 + j] * inv[s] * sc;
+                m = fmaxf(m, v[s]);
+            }
         }
         float total = 0.0f;
-        for (int s = 0; s < a.n; ++s) {
-            v[s] = expf(v[s] - m);
-            total += v[s];
+#pragma unroll
+        for (int s = 0; s < InkStates::kMax; ++s) {
+            if (s < a.n) {
+                v[s] = expf(v[s] - m);
+                total += v[s];
+            }
         }
-        for (int s = 0; s < a.n; ++s) coef[s * kQueries + j] = v[s] / total * inv[s];
+#pragma unroll
+        for (int s = 0; s < InkStates::kMax; ++s)
+            if (s < a.n) coef[s * kQueries + j] = v[s] / total * inv[s];
     }
     __syncthreads();
     for (int i = tid; i < n_embd; i += blockDim.x) {
