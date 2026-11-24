@@ -2966,7 +2966,6 @@ void Engine::fill_owed() {
         for (int e = 0; e < n_expert_; ++e) {
             uint8_t& o = owed_[il * (size_t) n_expert_ + (size_t) e];
             if (!o) continue;
-            o = 0;
             uint8_t* s = L.slot[(size_t) e];
             uint8_t*& src = owed_src_[il * (size_t) n_expert_ + (size_t) e];
             if (src) {   // the spare still holds it (the copy is queued before any later use of the spare)
@@ -2981,9 +2980,32 @@ void Engine::fill_owed() {
                 h2d(s + L.gu_bytes, L.exp_up + (size_t) e * L.u_stride, L.u_bytes);
                 h2d(s + L.gu2(), L.exp_down + (size_t) e * L.d_bytes, L.d_bytes);
             }
+            o = 0;   // (after the copy is queued: abandon_owed() takes one whose copy threw)
+            --n_owed_;
+        }
+    }
+}
+
+// fill_owed() threw (a CUDA error): an expert still owed has a slot with no bytes in it, so it leaves the cache, and
+// its mirror copy is its own again where its spare still holds it.
+void Engine::abandon_owed() {
+    if (n_owed_ == 0) return;
+    const size_t ne = (size_t) n_expert_;
+    for (size_t k = 0; k < owed_.size(); ++k) {
+        if (!owed_[k]) continue;
+        owed_[k] = 0;
+        layers_[k / ne].slot[k % ne] = nullptr;
+        --cached_;
+        if (uint8_t* m = owed_src_[k]) {
+            std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[k / ne].trade];
+            sp.erase(std::find(sp.begin(), sp.end(), m));
+            owed_spare_.erase(m);
+            owed_src_[k] = nullptr;
+            mirror_of_[k] = m;
         }
     }
     n_owed_ = 0;
+    staged_il_ = -1;
 }
 
 // An owed expert that a cut takes out: never uploaded, so the mirror keeps the copy fill_now() would have given up
@@ -3002,8 +3024,19 @@ void Engine::drop_owed(int il, int e) {
         return;
     }
     if (mirror_of_.empty() || mirror(il, e)) return;
-    uint8_t* s = mirror_take(il);
+    // A spare no owed expert's bytes are in, from the back as mirror_take() hands them out.  Only an owed one's left:
+    // mirror_take() queues that expert's upload from it on st_, which must be done before the CPU writes it.
+    std::vector<uint8_t*>& sp = mirror_spare_[(size_t) layers_[(size_t) il].trade];
+    uint8_t* s = nullptr;
+    for (size_t j = sp.size(); j > 0 && !s; --j)
+        if (!owed_spare_.count(sp[j - 1])) {
+            s = sp[j - 1];
+            sp.erase(sp.begin() + (ptrdiff_t) (j - 1));
+        }
+    if (!s && (s = mirror_take(il))) ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
     if (!s) return lock_queue(il, e);
+    // (from the files on this thread: an expert with no mirror copy that was on its way into the cache, rare; the
+    // copy back from the card fill_now() was followed by would have held the thread as long)
     const Layer& L = layers_[(size_t) il];
     std::memcpy(s, L.exp_gate + (size_t) e * L.gu_stride, L.gu_bytes);
     std::memcpy(s + L.gu_bytes, L.exp_up + (size_t) e * L.u_stride, L.u_bytes);
@@ -8080,7 +8113,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         ~Owe() {
             try {
                 e.end_owe();
-            } catch (...) {
+            } catch (...) {   // (an error the read throws already, or the next call's): no slot is left owed
+                e.abandon_owed();
             }
         }
     } owe{*this};

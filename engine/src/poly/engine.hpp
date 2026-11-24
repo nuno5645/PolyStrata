@@ -850,6 +850,7 @@ protected:
     void end_owe() {   ///< a read's cuts are done: what they owe is uploaded
         if (std::exchange(owe_, false)) fill_owed();
     }
+    void abandon_owed();   ///< after a failed fill_owed(): the owed experts leave the cache, their slots empty
     void widen_stage();
     void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
