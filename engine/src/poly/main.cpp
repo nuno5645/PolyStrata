@@ -582,6 +582,17 @@ struct Session {
                     }
                     use = policy.choose(1 + n_d, k, match);
                 }
+                // STRATA_WIN_POW2=1: windows of 1, 2, 4 or 8 tokens only (the largest of them that the pick holds), so
+                // fewer sizes are recorded as graphs; the guesses past it are left for a later window
+                static const bool pow2 = [] {
+                    const char* v = std::getenv("STRATA_WIN_POW2");
+                    return v && v[0] == '1';
+                }();
+                if (pow2 && use.t > 1 && use.pad == 0) {
+                    int p = 1;
+                    while (p * 2 <= use.t && p * 2 <= 8) p *= 2;
+                    use.t = p;
+                }
                 if (use.t == 1) {
                     if (card_picks) engine.eval_picks();
                     engine.eval(&t, 1, true);
