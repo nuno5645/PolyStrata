@@ -3775,6 +3775,8 @@ void Engine::follow(int written) {
     // forced, 16 a window took the mirror's spares faster than arrivals gave them back, and calls fell back to the
     // host; 1 a window kept the cache from following the answer.
     if (card_far_) n_free = std::max(0, std::min(n_free, kFarTrades));
+    // STRATA_SWAPS_WIDE: the uploads past 64 are for the empty slots a read left (above); trades stay at 64 a window
+    if (swaps_wide()) n_free = std::min(n_free, 64);
     if (n_free == 0) {
         if (asked) {
             { std::lock_guard<std::mutex> l(swap_m_); }
@@ -3903,8 +3905,8 @@ void Engine::load(const Options& o) {
         throw std::runtime_error("a prompt batch is 1 to 4096 tokens");
     if (opt_.stage_mib < 0) throw std::runtime_error("the staging buffer must be at least 1 MiB (0: the default)");
     if (opt_.stage_ahead < 0) throw std::runtime_error("the batch size to stage ahead from cannot be negative");
-    if (opt_.expert_swaps < -1 || opt_.expert_swaps > 64)
-        throw std::runtime_error("0 to 64 experts can be on their way into the cache at a time (-1: the default)");
+    if (opt_.expert_swaps < -1 || opt_.expert_swaps > (swaps_wide() ? 256 : 64))
+        throw std::runtime_error("0 to 64 experts (256 with STRATA_SWAPS_WIDE=1) can be on their way into the cache at a time (-1: the default)");
     // STRATA_WINDOW_MAX=9..16 (off by default: 8): --window takes up to that many, for repeats of the conversation
     // (prompt lookup) checked in one window.  A window under kStageRows still takes the few-token paths, each row
     // the bits it gets alone, so the answer is the same.
@@ -4232,7 +4234,10 @@ void Engine::load(const Options& o) {
     // and 5,120 MiB 87 and 98, UD-Q4_K_M there 31 and 38, Gemma 4 UD-Q6_K_XL with 5,120 MiB under 11 GiB at 6.9 GB
     // 100 and 137, at 2.9 GB 42 and 78.  In unified memory a swap is a copy within RAM: on the M5 Ultra held to 6-7
     // GiB, 64 of them wrote 3-5% faster.
-    if (opt_.expert_swaps < 0) opt_.expert_swaps = 64;
+    // STRATA_SWAPS_WIDE=1 (off by default): 128, so that the slots a prompt's read left empty fill sooner while the
+    // trades stay at 64 a window (follow()); okada-shogo/PolyStrata 31b77bc15: the first 64 tokens after a 32K prompt 5%
+    // faster, 15% over the first 16 (RTX 2070 Super, PCIe 3.0)
+    if (opt_.expert_swaps < 0) opt_.expert_swaps = swaps_wide() ? 128 : 64;
     if (opt_.ram_experts_mib >= 0) {
         // each size of slot takes the share of the budget its experts outside VRAM have of all of those
         pool_size_of_.assign(layers_.size(), 0);
@@ -5361,6 +5366,15 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
 #endif
         kernels::native_mmvq((int) w.type, w.p, xa, y + (size_t) at * w.n_out, w.n_in, w.n_out, m, st_);
     }
+}
+
+// STRATA_SWAPS_WIDE=1 (read once)
+bool Engine::swaps_wide() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SWAPS_WIDE");
+        return v && v[0] == '1';
+    }();
+    return on;
 }
 
 // STRATA_POLY_MMVQ_IL=1 (read once)

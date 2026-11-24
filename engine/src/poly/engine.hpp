@@ -362,6 +362,7 @@ public:
     /// the guesses can be checked, and keep(n) makes the first n tokens part of the sequence and forgets the rest.
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
+    static bool swaps_wide();   ///< STRATA_SWAPS_WIDE=1: up to 256 uploads into the cache at a time, 128 by default
     static bool mmvq_il_on();   ///< STRATA_POLY_MMVQ_IL=1: lin_raw()'s windows on the interleaved MMVQ kernels
     void window(const int32_t* tokens, int t);
     const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
