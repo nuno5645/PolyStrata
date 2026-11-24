@@ -52,6 +52,7 @@ protected:
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     int next_layer(int il) override;
+    int peek_next_layer(int il) const override;
     // a layer is some 20 launches: the card has 4 layers' work while the host launches the other 44
     int whole_first_layers() const override { return 4; }
     // its kernels in inkling2.cu wait for the launch before them in pdl_wait()

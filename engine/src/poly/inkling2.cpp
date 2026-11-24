@@ -1635,6 +1635,11 @@ int Inkling2::next_layer(int il) {
     return il + 1;
 }
 
+// next_layer()'s answer, with the pass left as it is (the guesses ahead, Engine::guess_layer())
+int Inkling2::peek_next_layer(int il) const {
+    return il == core_end_ - 1 && pass_ + 1 < n_pass_ ? core_start_ : il + 1;
+}
+
 // A layer's recordings: one a pass of the core, and for a full layer one a size of the rows it reads.
 int Inkling2::head_key(int il, int n) const {
     return pass_of(il) * 32 + (blocks_[(size_t) il].swa ? 0 : room_key(n));

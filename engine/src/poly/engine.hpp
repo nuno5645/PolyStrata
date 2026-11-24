@@ -529,6 +529,11 @@ protected:
     /// The layer a call runs after layer il's tail: the next one, unless the architecture runs some of its layers
     /// more than once a token (a looped core).  hi_ or more ends the call's layers.
     virtual int next_layer(int il) { return il + 1; }
+    /// The layer next_layer(il) would give, without moving a loop's pass (STRATA_LOOP_GUESS: the guesses ahead).
+    virtual int peek_next_layer(int il) const { return il + 1; }
+    /// The next layer with routed experts after il whose router guesses ahead: il + 1 on, or with STRATA_LOOP_GUESS=1
+    /// the loop's next visit (peek_next_layer()).
+    int guess_layer(int il) const;
     /// Whether read() may take a prompt's calls through a layer together before the next layer.  Not where a call's
     /// layers keep rows of their own between them, or do not run in order.
     virtual bool reads_by_layer() const { return true; }

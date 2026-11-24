@@ -4657,8 +4657,7 @@ int Engine::card_rows() const {
 // The router's scores, and the copies of them and of the experts' input to the host.
 void Engine::moe_router(const Layer& L, int n) {
     const size_t ne = (size_t) n_expert_;
-    int j = (int) (&L - layers_.data()) + 1;   // the next MoE layer, whose router on this layer's input guesses ahead
-    while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
+    const int j = guess_layer((int) (&L - layers_.data()));   // the next MoE layer, whose router on this layer's input guesses ahead
     size_t part = 0;
     for (size_t q = 0; q < 8; ++q)
         if (ev_ == ev_row_[q]) part = q;
@@ -5217,6 +5216,16 @@ int Engine::win_pick(const Layer& L, int il, const CpuExpert* host, const int32_
     return k;
 }
 
+int Engine::guess_layer(int il) const {
+    static const bool loop = [] {
+        const char* v = std::getenv("STRATA_LOOP_GUESS");
+        return v && v[0] == '1';
+    }();
+    int j = loop ? peek_next_layer(il) : il + 1;
+    while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
+    return j;
+}
+
 // The routed experts of tokens that come a few at a time.  moe_router() is on its way, with ev_ behind it.  True
 // when experts were computed on the CPU: their sum waits in h_cpu_ for moe_add().  `first` is run once, by the
 // thread that hands the cached experts to the card and ahead of them.
@@ -5239,8 +5248,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         size_t part = 0;
         for (size_t q = 0; q < 8; ++q)
             if (ev_ == ev_row_[q]) part = q;
-        int j = il + 1;
-        while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
+        const int j = guess_layer(il);
         if (j < n_layer_ && pool_) pool_ahead(j, n, part, prefetch_k_);
         else if (j < n_layer_ && aheads) ahead_j = j, ahead_part = part;
     }
