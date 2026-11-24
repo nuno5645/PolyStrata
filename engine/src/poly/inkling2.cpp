@@ -618,7 +618,13 @@ void Inkling2::guess_block(int32_t token) {
             }
             ck(cudaStreamEndCapture(cs(st_), &graph), "cudaStreamEndCapture");
             cudaGraphExec_t exec = nullptr;
-            const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+            cudaError_t made = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+            for (int tries = 0; made == cudaErrorMemoryAllocation && tries < 8 &&
+                                oom_give(size_t(64) << 20, "the drafter's recording");
+                 ++tries) {
+                exec = nullptr;
+                made = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+            }
             cudaGraphDestroy(graph);
             ck(made, "cudaGraphInstantiate");
             graphs_.push_back(exec);

@@ -2067,8 +2067,18 @@ void Engine::cover(int64_t end) {
         if (cut) shrink_cache(cut);
     }
     // in pieces of kv_grow() rows, so that trim_card_kv() can give back what a long read mapped in one go
-    for (Kv& k : kv_)
-        vmm_map(k, size(k), (size_t) ((kv_grow() + k.per - 1) / k.per) * k.bytes, "the attention cache");
+    for (int tries = 0;; ++tries) {
+        try {
+            for (Kv& k : kv_)
+                vmm_map(k, size(k), (size_t) ((kv_grow() + k.per - 1) / k.per) * k.bytes, "the attention cache");
+            break;
+        } catch (const std::runtime_error&) {
+            // STRATA_OOM_RETRY: what the maps still need, and 64 MiB, from the expert cache (oom_give())
+            size_t left = 0;
+            for (const Kv& k : kv_) left += size(k) > k.mapped ? size(k) - k.mapped : 0;
+            if (tries >= 4 || !oom_give(left + (size_t(64) << 20), "the attention cache")) throw;
+        }
+    }
     kv_rows_ = rows;
 }
 
@@ -2142,6 +2152,29 @@ void Engine::settle_swaps() {
     if (failed()) throw std::runtime_error("expert upload: " + swap_error_);
     ck(cudaStreamSynchronize(cs(swap_st_)), "expert upload");
     follow(0);
+}
+
+// STRATA_OOM_RETRY=1: a graph's instantiation or an attention cache's map that the card had no memory for
+// (cudaGraphInstantiate: out of memory, an error 400 for the request) takes it from the expert cache instead, as
+// cover() does for rows it plans: its least used experts leave, and the work is tried again.  Only the VMM cache in
+// pieces gives VRAM back to the card (with --vram-pool the pieces stay the pool's, without VMM it is one allocation).
+// What experts the cache holds decides which take the CPU path, as every resize of it does (cover(), mind_vram()).
+bool Engine::oom_give(size_t bytes, const char* what) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_OOM_RETRY");
+        return v && v[0] == '1';
+    }();
+    if (!on || !exp_ || !vmm_ || pool_on_ || freeze_experts_ || arena_.mapped == 0) return false;
+    cudaGetLastError();
+    const size_t had = arena_.mapped;
+    const int experts = cached_;
+    shrink_cache(bytes);
+    held_is_budget();
+    if (arena_.mapped >= had) return false;
+    std::fprintf(stderr, "strata-poly: STRATA_OOM_RETRY: no VRAM for %s: the expert cache gave %.0f MiB, %d -> %d "
+                         "experts, and it is tried again\n",
+                 what, double(had - arena_.mapped) / 1048576.0, experts, cached_);
+    return true;
 }
 
 // The expert cache gives up `bytes` or a little more from its end, and loads nothing again: the experts whose
@@ -7914,6 +7947,10 @@ void* Engine::record(F&& work) {
         exec = nullptr;
         made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
+    for (int tries = 0; made == cudaErrorMemoryAllocation && tries < 8 && oom_give(size_t(64) << 20, "a recording"); ++tries) {
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
 #if !defined(STRATA_GPU_METAL)
     const uint64_t kernels = tl_ ? graph_kernels(g) : 0;
 #endif
@@ -7994,6 +8031,12 @@ void* Engine::record_step(const std::function<void()>& work) {
         ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
         exec = nullptr;
         made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
+    for (int tries = 0; !forced && made == cudaErrorMemoryAllocation && tries < 8 &&
+                        oom_give(size_t(64) << 20, "a step's recording");
+         ++tries) {
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     }
 #if !defined(STRATA_GPU_METAL)
     const uint64_t kernels = tl_ && made == cudaSuccess ? graph_kernels(g) : 0;

@@ -891,6 +891,10 @@ protected:
     size_t vpool_bytes() const { return vpool_.size() * pg_; }
     size_t kv_step_bytes() const;
     void shrink_cache(size_t bytes);
+    /// STRATA_OOM_RETRY=1: the expert cache gives up `bytes` (shrink_cache()) for a recording or a map that the card
+    /// had no memory for, which is then tried again.  False when it gave nothing (the env off, no VMM cache, the pool,
+    /// a frozen cache, an empty one).
+    bool oom_give(size_t bytes, const char* what);
     int grow_cache(size_t bytes, bool later = false);
     /// The buffers only a prompt's calls use (alloc()): mapped apart, and the expert cache's between prompts.
     Mapped prompt_map_;
