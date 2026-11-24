@@ -600,14 +600,16 @@ constexpr int kDownThreads = 512;   // ink_ctrl_down_kernel's block: half of gem
 // its threads t and t + 512, warps w and w + 16, and the 32 warps' sums are added in their order.  The same bits,
 // and with half the threads a block, a launch's 3 * 64 blocks are one wave on the card.
 template <typename W>
+// (controller j's pointers by ink_pick(): d.cur[j] with j from blockIdx copied CtrlDown's 96 bytes to local memory in
+// every block on sm_75, and made the loads through them generic ones; the same values and sums)
 __global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d, int n_embd, int rank) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
     __shared__ float pa[kCatThreads / WARP], pb[kCatThreads / WARP], part[32];
     const int j = blockIdx.x / rank, o = blockIdx.x % rank, tid = threadIdx.x;
     const size_t row = size_t(blockIdx.y) * n_embd;
-    const float* cur = d.cur[j] + row;
-    const float* msg = d.msg[j] + row;
+    const float* cur = ink_pick(d.cur, j) + row;
+    const float* msg = ink_pick(d.msg, j) + row;
     if (tid < kCatThreads) {
         float a, b;
         cat_squares(cur, msg, n_embd, tid, a, b);
@@ -620,7 +622,7 @@ __global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d,
     for (int k = 0; k < kCatThreads / WARP; ++k) sa += pa[k];
     for (int k = 0; k < kCatThreads / WARP; ++k) sb += pb[k];
     const float ia = cat_scale(sa, n_embd), ib = cat_scale(sb, n_embd);
-    const W* __restrict__ wr = static_cast<const W*>(d.w[j]) + size_t(o) * 2 * n_embd;
+    const W* __restrict__ wr = static_cast<const W*>(ink_pick(d.w, j)) + size_t(o) * 2 * n_embd;
     const int n_in = 2 * n_embd;
     float acc0 = 0.0f, acc1 = 0.0f;   // gemv_set_kernel's threads tid and tid + kDownThreads
     for (int i = tid; i < n_in; i += 2 * kDownThreads) {
@@ -639,7 +641,7 @@ __global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d,
     if (tid == 0) {
         float sum = 0.0f;
         for (int k = 0; k < 2 * kDownThreads / WARP; ++k) sum += part[k];
-        d.y[j][size_t(blockIdx.y) * rank + o] = sum;
+        ink_pick(d.y, j)[size_t(blockIdx.y) * rank + o] = sum;
     }
 }
 
@@ -657,9 +659,9 @@ __global__ void __launch_bounds__(kFastDownThreads) ink_ctrl_down_fast_kernel(Ct
     __shared__ float part[kFastDownThreads / WARP][4];
     const int j = blockIdx.x / rank, o = blockIdx.x % rank, tid = threadIdx.x;
     const size_t row = size_t(blockIdx.y) * n_embd;
-    const float* __restrict__ cur = d.cur[j] + row;
-    const float* __restrict__ msg = d.msg[j] + row;
-    const W* __restrict__ wl = static_cast<const W*>(d.w[j]) + size_t(o) * 2 * n_embd;
+    const float* __restrict__ cur = ink_pick(d.cur, j) + row;
+    const float* __restrict__ msg = ink_pick(d.msg, j) + row;
+    const W* __restrict__ wl = static_cast<const W*>(ink_pick(d.w, j)) + size_t(o) * 2 * n_embd;
     const W* __restrict__ wr = wl + n_embd;
     float dl = 0.0f, dr = 0.0f, cc = 0.0f, mm = 0.0f;
     for (int i = tid; i < n_embd; i += kFastDownThreads) {
@@ -677,7 +679,7 @@ __global__ void __launch_bounds__(kFastDownThreads) ink_ctrl_down_fast_kernel(Ct
         for (int w = 0; w < kFastDownThreads / WARP; ++w)
 #pragma unroll
             for (int k = 0; k < 4; ++k) v[k] += part[w][k];
-        d.y[j][size_t(blockIdx.y) * rank + o] = v[0] * cat_scale(v[2], n_embd) + v[1] * cat_scale(v[3], n_embd);
+        ink_pick(d.y, j)[size_t(blockIdx.y) * rank + o] = v[0] * cat_scale(v[2], n_embd) + v[1] * cat_scale(v[3], n_embd);
     }
 }
 
@@ -716,23 +718,42 @@ __global__ void ink_gate_kernel(GateSet s, size_t n) {
         if (j < s.count) s.out[j][i] = c[j] - tanhf(s.forget[j][i]) * c[j] + tanhf(s.gain[j][i]) * s.msg[j][i];
 }
 
-// Token t's convolved value of channel c (ink_conv()).
-__device__ __forceinline__ float conv_value(const float* x, const float* state, const float* __restrict__ w,
-                                            const float* dyn, int channels,
-                                            int heads, int taps, int t, int c, float norm) {
-    float past[8];   // past[k]: the input k tokens back
+// Token t's convolved value of channel c (ink_conv()), for TAPS taps (0: the count taps): with the count known here
+// past[] is indexed by constants and stays in registers; with a run-time count it was a local array (STACK 32 on sm_75
+// in ink_conv_kernel, ink_conv_few_kernel and ink_qkv_kernel, a store and a load of each tap per value).  The loads,
+// products and sums are the same, in the same order, whichever way it is taken.
+template <int TAPS>
+__device__ __forceinline__ float conv_value_t(const float* x, const float* state, const float* __restrict__ w,
+                                              const float* dyn, int channels,
+                                              int heads, int taps_rt, int t, int c, float norm) {
+    const int taps = TAPS ? TAPS : taps_rt;
+    float past[TAPS ? TAPS : 8];   // past[k]: the input k tokens back
+#pragma unroll
     for (int k = 0; k < taps; ++k) {
         const int u = t - k;
         past[k] = u >= 0 ? x[size_t(u) * channels + c] : state[size_t(taps - 1 + u) * channels + c];
     }
     float acc = 0.0f;
+#pragma unroll
     for (int j = 0; j < taps; ++j) acc += past[taps - 1 - j] * w[size_t(c) * taps + j];
     if (dyn) {
         const int head = c / (channels / heads);
         const float* d = dyn + (size_t(t) * heads + head) * taps;
+#pragma unroll
         for (int lag = 0; lag < taps; ++lag) acc += past[lag] * d[lag];
     }
     return (past[0] + acc) * norm;
+}
+
+__device__ __forceinline__ float conv_value(const float* x, const float* state, const float* __restrict__ w,
+                                            const float* dyn, int channels,
+                                            int heads, int taps, int t, int c, float norm) {
+    switch (taps) {
+        case 2: return conv_value_t<2>(x, state, w, dyn, channels, heads, taps, t, c, norm);
+        case 3: return conv_value_t<3>(x, state, w, dyn, channels, heads, taps, t, c, norm);
+        case 4: return conv_value_t<4>(x, state, w, dyn, channels, heads, taps, t, c, norm);
+        default: return conv_value_t<0>(x, state, w, dyn, channels, heads, taps, t, c, norm);
+    }
 }
 
 // Channel c's state after a call of `rows` tokens: the last taps - 1 inputs, oldest first.
@@ -805,7 +826,9 @@ __global__ void ink_conv_snaps_kernel(const float* x, const float* state, float*
 // ink_conv_state_kernel do in turn, then the stream's update ink_conv_add_kernel makes, the same bits in one launch
 __global__ void ink_conv_few_kernel(InkConv j0, InkConv j1, size_t stride, unsigned bits, int channels, int heads,
                                     int taps, int rows) {
-    const InkConv& j = blockIdx.y ? j1 : j0;
+    // a copy, each field picked from j0 or j1: a reference to one of the two made nvcc copy both to local memory in
+    // every block (STACK 192 on sm_75), and the pointers read back from there made the loads generic ones
+    const InkConv j = blockIdx.y ? j1 : j0;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     for (int t = 0; t < rows; ++t) {
