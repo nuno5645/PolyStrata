@@ -3782,6 +3782,19 @@ void Engine::follow(int written) {
         const int h = v ? std::atoi(v) : 0;
         return h >= 1 && h <= 65536 ? h : kSwapHalf;
     }();
+    // STRATA_SWAP_GAIN=G / STRATA_SWAP_MIN=M (defaults 2 and kSwapMin): an expert comes in for a cached one when its
+    // recent uses are at least G times the cached one's plus M.  NInfer's tiering (--tier gain 1.5, decay 0.7 every
+    // 12 tokens, a half-life of ~23) follows an answer sooner; with STRATA_SWAP_HALF=23 these give its policy.
+    static const float swap_gain = [] {
+        const char* v = std::getenv("STRATA_SWAP_GAIN");
+        const float g = v ? (float) std::atof(v) : 0.f;
+        return g >= 1.f && g <= 16.f ? g : 2.f;
+    }();
+    static const float swap_min = [] {
+        const char* v = std::getenv("STRATA_SWAP_MIN");
+        const float m = v ? (float) std::atof(v) : -1.f;
+        return m >= 0.f && m <= 64.f ? m : kSwapMin;
+    }();
     const float keep = std::exp2(-(float) written / (float) swap_half);
     for (float& r : recent_) r *= keep;
     const auto from_pool = [&](Swap& s) {   // the slot follow_loop() copies s from, held until s arrives
@@ -3854,7 +3867,7 @@ void Engine::follow(int written) {
             const float r = recent_[i];
             const int64_t p = prior_.empty() ? 0 : prior_[i];
             if (L.slot[(size_t) e]) put(out, {il, e, r, p}, less);
-            else if (r >= kSwapMin && !coming_[i]) put(in, {il, e, r, p}, more);
+            else if (r >= swap_min && !coming_[i]) put(in, {il, e, r, p}, more);
         }
     }
 
@@ -3868,7 +3881,7 @@ void Engine::follow(int written) {
             const size_t k = (size_t) c * most + trade_at_[(size_t) c];
             const Pick& in = in_[k];
             const Pick& out = out_[k];
-            if (in.il < 0 || out.il < 0 || in.recent < 2.f * out.recent + kSwapMin) continue;
+            if (in.il < 0 || out.il < 0 || in.recent < swap_gain * out.recent + swap_min) continue;
             if (best < 0 || in.recent - out.recent > gain) {
                 best = c;
                 gain = in.recent - out.recent;
