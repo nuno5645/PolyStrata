@@ -5979,6 +5979,55 @@ bool slot_lanes_on() {
 }
 #endif
 
+#if !defined(__HIPCC__)
+// NVFP4 rows for MmvqSlots::lanes / MmvqIds::lanes (Inkling 2's cached experts, CUDA).  mmvq_slots_kernel gives a row a
+// warp: UD-IQ3_XXS's NVFP4 down (blocks 0-19, K = 1152) is 36 calls a row, so the second pass over the lanes keeps 4
+// of 32 busy.  As mmvq_slots_iq3_kernel does for IQ3, a warp takes R rows as one run of R x C calls (C = calls a row),
+// lane p taking call 32 i + p of the run: with R = 8 and C = 36 that is 9 full passes.  Row r's calls c = L (mod 32)
+// all land on lane (L + r C) mod 32 in increasing c, each Fmt<40>::dot as row_dot calls it, so that lane holds
+// row_dot's lane-L sum term for term (0.0f where row_dot's lane L has no call); a shuffle moves it back to lane L
+// before the same warp_sum: mmvq_slots_kernel's bits (poly_nvfp4_lanes_test).  The run's row and call are stepped
+// rather than divided out.  Opt-in while it is measured: STRATA_NVFP4_LANES=1 (STRATA_OLD_IQ_MMVQ=1 keeps the old one).
+bool nvfp4_lanes_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NVFP4_LANES");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+template<int TY, int R, typename S>
+__global__ void __launch_bounds__(128) mmvq_slots_run_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    using F = Fmt<TY>;
+    const int row0 = (blockIdx.x * 4 + threadIdx.y) * R;
+    if (row0 >= n_out) return;
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int lane = threadIdx.x, C = (n_in / F::qk) * F::ipb, rows = min(R, n_out - row0), n = rows * C;
+    if (C <= 0) return;   // (whole warps)
+    const uint8_t* w = (const uint8_t*) at.w + (size_t) row0 * row_bytes;
+    const block_q8_1* x = (const block_q8_1*) at.x;
+    float acc[R];
+#pragma unroll
+    for (int q = 0; q < R; ++q) acc[q] = 0.0f;
+    int r = 0, c = lane;   // call f = r C + c of the run
+    while (c >= C && r < rows) c -= C, ++r;
+    for (int f = lane; f < n; f += 32) {
+        const int kbx = c / F::ipb, iqs = F::step * (c % F::ipb);
+        const float v = F::dot(w + (size_t) r * row_bytes, x + kbx * (F::qk / 32), kbx, iqs);
+#pragma unroll
+        for (int q = 0; q < R; ++q)
+            if (q == r) acc[q] += v;
+        c += 32;
+        while (c >= C) c -= C, ++r;
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        float v = __shfl_sync(0xffffffffu, acc[q], (lane + q * C) & 31);
+        v = warp_sum(v);
+        if (q < rows && lane == 0) at.y[row0 + q] = v;
+    }
+}
+#endif
+
 template<typename S>
 void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
@@ -6005,6 +6054,15 @@ void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* strea
         case 29: mmvq_slots_staged_kernel<29, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
         default: mmvq_slots_staged_kernel<19, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
         }
+        check("iq_mmvq_slots");
+        return;
+    }
+#endif
+#if !defined(__HIPCC__)
+    if (t == 40 && slots.lanes && !g_old_kernels && nvfp4_lanes_on()) {
+        constexpr int R = 8;   // 36 calls a 1152 row: 8 rows are 9 full passes over the lanes
+        const dim3 g8((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+        mmvq_slots_run_kernel<40, R, S><<<g8, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);
         check("iq_mmvq_slots");
         return;
     }

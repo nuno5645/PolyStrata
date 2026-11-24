@@ -506,6 +506,15 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
     add_test(NAME poly_iq3_lanes_test COMMAND poly_iq3_lanes_test)
     set_tests_properties(poly_iq3_lanes_test PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # the cached experts' NVFP4 slots launches with MmvqSlots::lanes and STRATA_NVFP4_LANES=1 (a warp's rows as one run of
+  # calls) against the same launches without it and native_mmvq(), bit for bit, on random blocks; CUDA only, needs a card
+  if(STRATA_ENABLE_CUDA)
+    add_executable(poly_nvfp4_lanes_test src/poly/nvfp4_lanes_test.cu)
+    target_include_directories(poly_nvfp4_lanes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+    target_link_libraries(poly_nvfp4_lanes_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME poly_nvfp4_lanes_test COMMAND poly_nvfp4_lanes_test)
+    set_tests_properties(poly_nvfp4_lanes_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # the same for native_mmvq.cu's formats (IQ4_NL, Q8_0, Q2_0, MXFP4, ...): the slots launches with MmvqSlots::lanes
   # against the same launches without it, bit for bit, on random blocks (no model); CUDA only, needs a card
   if(STRATA_ENABLE_CUDA)
