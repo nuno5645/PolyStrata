@@ -1,0 +1,88 @@
+# hp-2060: strata-poly only, Linux x64, CUDA 13.0, sm_75 only (RTX 2060), for A/B tests on one PC.
+# Same toolchain family as the release's Linux package (Ubuntu 22.04, gcc 12, CUDA 13.0) and the same
+# configure flags as tools/packaging/build_cuda_linux.sh.
+name: hp-2060
+
+on:
+  push:
+    branches: [hp-2060]
+  workflow_dispatch:
+
+concurrency:
+  group: hp-2060-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container: nvidia/cuda:13.0.2-devel-ubuntu22.04
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates ninja-build ccache gcc-12 g++-12 python3-pip file binutils
+          python3 -m pip install --no-cache-dir 'cmake==3.31.6'
+          cmake --version | head -1
+          nvcc --version | tail -2
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-hp2060-sm75-${{ github.sha }}
+          restore-keys: ccache-hp2060-sm75-
+      - name: Configure
+        run: |
+          cmake -G Ninja -S engine -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+            -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=OFF \
+            -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON \
+            "-DCMAKE_CUDA_ARCHITECTURES=75-real" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+      - name: Build strata-poly and its tests
+        run: |
+          ccache -z
+          cmake --build build --target strata-poly poly_mmq_paths_test poly_inkling2_test -j "$(nproc)"
+          ccache -s | head -12
+      - name: Stage
+        run: |
+          set -eu
+          mkdir -p out/lib
+          cp build/strata-poly build/poly_mmq_paths_test build/poly_inkling2_test out/
+          for so in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
+            cp -L /usr/local/cuda/lib64/$so out/lib/ 2>/dev/null || cp -L "$(find /usr/local/cuda/ -name "$so" | head -1)" out/lib/
+          done
+          nv=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')
+          printf '{"branch":"%s","commit":"%s","cuda":"%s","archs":"75-real","host":"ubuntu22.04 gcc-12"}\n' \
+            "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "$nv" > out/BUILD.json
+          cat > out/run.sh <<'SH'
+          #!/bin/sh
+          # runs strata-poly with the CUDA 13 libraries shipped next to it
+          d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+          LD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$d/strata-poly" "$@"
+          SH
+          sed -i 's/^          //' out/run.sh
+          chmod +x out/run.sh out/strata-poly
+          file out/strata-poly; readelf -d out/strata-poly | grep NEEDED; ls -la out out/lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strata-poly-sm75
+          path: |
+            out/strata-poly
+            out/poly_mmq_paths_test
+            out/poly_inkling2_test
+            out/run.sh
+            out/BUILD.json
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strata-poly-sm75-cuda13-libs
+          path: out/lib
+          retention-days: 14
