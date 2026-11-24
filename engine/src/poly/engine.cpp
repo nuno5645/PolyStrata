@@ -5431,6 +5431,24 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
     }
 }
 
+// The CPU's share of a layer's experts outside VRAM, by the call's size (moe_rows()): share_, or with
+// STRATA_SHARE_BY_TYPE=1 (off by default) one for each kind of layer by its matrix types (gate/up, up, down).  The CPU's
+// time for an expert and the card's differ by type: Inkling 2 UD-IQ3_XXS has IQ3_XXS and IQ2_S gate/up layers and NVFP4
+// and IQ4_NL down ones, and one share for all, set by each call in turn, fitted the layer before
+// (okada-shogo/PolyStrata b542a8b39).  Which experts the CPU computes moves; each is the same expert.
+double* Engine::share_of(const Layer& L) {
+    static const bool by_type = [] {
+        const char* v = std::getenv("STRATA_SHARE_BY_TYPE");
+        return v && v[0] == '1';
+    }();
+    if (!by_type) return share_;
+    const int gt = (int) L.gu_type, ut = (int) L.u_type, dt = (int) L.d_type;
+    for (TypeShare& x : type_share_)
+        if (x.gt == gt && x.ut == ut && x.dt == dt) return x.s;
+    type_share_.push_back({gt, ut, dt, {0.25, 0.25, 0.25, 0.25, 0.25}});
+    return type_share_.back().s;
+}
+
 // STRATA_SWAPS_WIDE=1 (read once)
 bool Engine::swaps_wide() {
     static const bool on = [] {
@@ -7459,7 +7477,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         std::stable_sort(spare_.begin(), spare_.end(),
                          [&](int32_t a, int32_t b) { return count_[(size_t) a] < count_[(size_t) b]; });
         n_spare = (int) spare_.size();
-        const double s = opt_.cpu_share > 0 ? std::min(opt_.cpu_share, 1.f) : share_[size];
+        const double s = opt_.cpu_share > 0 ? std::min(opt_.cpu_share, 1.f) : share_of(L)[size];
         n_cpu = (int) std::lround(s * n_spare);
         for (int j = 0; j < n_cpu; ++j) on_cpu_[(size_t) spare_[(size_t) j]] = 1;
     }
@@ -7818,7 +7836,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         // the share that would have had both done at once, if each one's time grows with its share
         if (opt_.cpu_share < 0 && n_cpu < n_spare && !freeze_experts_) {
             const double s = (double) n_cpu / n_spare, c = cpu / s, g = gpu / (1 - s);
-            share_[size] = std::clamp(0.5 * share_[size] + 0.5 * g / (c + g), 0.05, 0.95);
+            double& sh = share_of(L)[size];
+            sh = std::clamp(0.5 * sh + 0.5 * g / (c + g), 0.05, 0.95);
         }
     }
     pmark(prof::kExpertsGpu);

@@ -1408,6 +1408,12 @@ protected:
     std::vector<CpuExpert> host_;  ///< their uses, by token
     double share_[5] = {0.25, 0.25, 0.25, 0.25, 0.25};   ///< the CPU's share of spare_, by the call's tokens:
                                                          ///< under 64, from 64, 128, 256 and 512
+    struct TypeShare {               ///< STRATA_SHARE_BY_TYPE: the same, for layers of these matrix types
+        int gt, ut, dt;
+        double s[5];
+    };
+    std::vector<TypeShare> type_share_;
+    double* share_of(const Layer& L);
     std::unique_ptr<Workers> stagers_;   ///< fill the staging buffers meanwhile
 
     // The cache follows what is written (follow()).  It is filled for the average answer; while one is written,
