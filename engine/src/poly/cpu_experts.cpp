@@ -7,7 +7,9 @@
 #include "strata/quant/types.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <mutex>
@@ -24,6 +26,30 @@ constexpr int kRowsStep = 4;   // a gate and up task's rows are a multiple of th
 constexpr int kRowsPerDownTask = 16;
 constexpr int kRowsOnCaller = 4;   // up to this many rows' activations are quantized by the caller's thread
 constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
+
+// How long an idle thread pauses before it sleeps.  kSpinsBeforeSleep pauses are a millisecond on some CPUs and about
+// 0.3 ms on Zen 2, under the time between two layers' calls while a model answers, so a worker slept between layers
+// and each call paid its wake-up (futex).  STRATA_WORKER_SPIN_US=N (off by default): N microseconds of pauses instead,
+// the clock read every 64 (Aryan7901/PolyStrata a2044e284: about 4 ms in all, a thread's start 46 -> 4 us).
+class Idle {
+public:
+    /// Another pause before sleeping?
+    bool spin() {
+        static const long long us = [] {
+            const char* v = std::getenv("STRATA_WORKER_SPIN_US");
+            return v ? std::max(0LL, std::atoll(v)) : 0LL;
+        }();
+        if (us <= 0) return ++n_ < kSpinsBeforeSleep;
+        if (n_++ == 0) since_ = std::chrono::steady_clock::now();
+        if ((n_ & 63) != 0) return true;
+        return std::chrono::steady_clock::now() - since_ < std::chrono::microseconds(us);
+    }
+    void reset() { n_ = 0; }
+
+private:
+    int n_ = 0;
+    std::chrono::steady_clock::time_point since_;
+};
 
 namespace Q = strata::quant;
 
@@ -174,7 +200,7 @@ bool Workers::drain(Batch& b) {
 // their time slices, every batch.
 void Workers::loop(int i) {
     std::atomic<int>& busy = busy_[(size_t) i].on;
-    int idle = 0;
+    Idle idle;
     uint32_t seen = posted_.load() - 1;   // the count at which this worker last found nothing to do
     while (!quit_.load(std::memory_order_relaxed)) {
         const uint32_t now = posted_.load(std::memory_order_acquire);
@@ -188,12 +214,12 @@ void Workers::loop(int i) {
                 busy.store(0, std::memory_order_release);
             }
             if (ran) {
-                idle = 0;
+                idle.reset();
                 continue;
             }
             seen = now;
         }
-        if (++idle < kSpinsBeforeSleep) {
+        if (idle.spin()) {
             _mm_pause();
             continue;
         }
@@ -201,7 +227,7 @@ void Workers::loop(int i) {
         sleepers_.fetch_add(1);
         if (!quit_.load()) posted_.wait(seen);
         sleepers_.fetch_sub(1);
-        idle = 0;
+        idle.reset();
     }
 }
 
@@ -241,7 +267,7 @@ Aside::~Aside() {
 // few hundred microseconds after the last while a model answers.
 void Aside::loop() {
     uint32_t seen = 0;
-    int idle = 0;
+    Idle idle;
     while (true) {
         const uint32_t now = posted_.load(std::memory_order_acquire);
         if (quit_.load(std::memory_order_relaxed)) return;
@@ -253,10 +279,10 @@ void Aside::loop() {
                 failed_ = std::current_exception();
             }
             done_.store(now, std::memory_order_release);
-            idle = 0;
+            idle.reset();
             continue;
         }
-        if (++idle < kSpinsBeforeSleep) {
+        if (idle.spin()) {
             _mm_pause();
             continue;
         }
@@ -264,7 +290,7 @@ void Aside::loop() {
         sleeping_.store(true);
         posted_.wait(seen);
         sleeping_.store(false);
-        idle = 0;
+        idle.reset();
     }
 }
 
