@@ -910,7 +910,7 @@ Engine::~Engine() {
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
     for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_,
-                    ev_saved_, ev_bell_})
+                    ev_saved_, ev_bell_, ev_pv_[0], ev_pv_[1], ev_pv_free_[0], ev_pv_free_[1]})
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (void* e : swap_pin_ev_)
         if (e) cudaEventDestroy((cudaEvent_t) e);
@@ -2536,7 +2536,7 @@ void Engine::ensure_stage() {
     if (opt_.metal_balanced && all_cached()) return;
 #endif
     if (stage_wide_ > stage_narrow_) {
-        vmm_reserve(stage_map_, stage_wide_ + 256 + kTail);
+        vmm_reserve(stage_map_, pv_mode_ ? pv_off_ + stage_wide_ + 256 + kTail : stage_wide_ + 256 + kTail);
         // with the pool the buffer comes out of it, and out of the expert cache when the pool lacks the room
         if (pool_on_ && pool_claimed_ && exp_) {
             const size_t need = up_to(stage_narrow_ + 256 + kTail, pg_);
@@ -2746,7 +2746,8 @@ void Engine::widen_stage() {
     if (stage_lent_ || stage_wide_ <= stage_narrow_) return;
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
     ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
-    const size_t want = up_to(stage_wide_ + 256 + kTail, pool_on_ ? pg_ : grain_) - stage_map_.mapped;
+    const size_t span = pv_mode_ ? pv_off_ + stage_wide_ + 256 + kTail : stage_wide_ + 256 + kTail;
+    const size_t want = up_to(span, pool_on_ ? pg_ : grain_) - stage_map_.mapped;
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
     if (pool_on_) free_b = vpool_bytes();   // what the card has is the pool's
@@ -2760,13 +2761,14 @@ void Engine::widen_stage() {
     }
     stage_lent_ = true;   // narrow_stage() gives back what was cut even if the map below fails
     try {
-        vmm_map(stage_map_, stage_wide_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
+        vmm_map(stage_map_, span, SIZE_MAX, "the expert staging buffer");
     } catch (const std::runtime_error&) {
         narrow_stage();
         return;
     }
     stage_bytes_ = stage_wide_;
     staged_il_ = -1;
+    pv_ok_ = pv_mode_ != 0;
 }
 
 // The read is done: the staging buffer goes back to stage_narrow_, and the expert cache takes back what it gave
@@ -2779,6 +2781,7 @@ void Engine::narrow_stage() {
     stage_bytes_ = stage_narrow_;
     staged_il_ = -1;
     stage_lent_ = false;
+    pv_ok_ = false;
     if (exp_ && stage_cut_ > 0) grow_cache(stage_cut_, true);
     stage_cut_ = 0;
 }
@@ -4067,11 +4070,18 @@ void Engine::alloc() {
         stage_narrow_ = stage_wide_ = stage_bytes_;
         if (widens && read_mib > 0)
             stage_wide_ = std::max(stage_bytes_, std::min((size_t) read_mib << 20, (size_t) n_expert_ * one_expert));
+        if (const char* v = std::getenv("STRATA_PREFETCH_VISIT"); v && std::atoi(v) == 1 && stage_wide_ > stage_narrow_) {
+            pv_mode_ = 1;
+            pv_off_ = (stage_wide_ + 256 + kTail + 4095) / 4096 * 4096;
+            std::fprintf(stderr, "strata-poly: STRATA_PREFETCH_VISIT: a prompt's read stages two visits' experts (2 x %.0f MiB)\n",
+                         stage_wide_ / 1048576.0);
+        }
 #if defined(STRATA_GPU_METAL)
         if (!opt_.metal_balanced)
 #endif
             ensure_stage();
-        for (void** e : {&ev_stage_[0], &ev_stage_[1], &ev_ahead_, &ev_free_}) {
+        for (void** e : {&ev_stage_[0], &ev_stage_[1], &ev_ahead_, &ev_free_, &ev_pv_[0], &ev_pv_[1], &ev_pv_free_[0],
+                         &ev_pv_free_[1]}) {
             cudaEvent_t ev = nullptr;
             ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
             *e = ev;
@@ -5222,7 +5232,9 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
     }
     int ahead_j = -1;   // vram_ahead()'s layer: launch() sends its guesses
     size_t ahead_part = 0;
-    const bool aheads = ahead_slots_ > 0 && !freeze_experts_;   // a frozen answer's experts go where its first's did
+    // a frozen answer's experts go where its first's did; in a read by halves (STRATA_PREFETCH_VISIT) the buffer is not
+    // vram_ahead()'s
+    const bool aheads = ahead_slots_ > 0 && !freeze_experts_ && !pv_live_;
     if (prefetch_k_ > 0 && !block_pass_ && n <= 16) {   // as moe_router() asked for it
         size_t part = 0;
         for (size_t q = 0; q < 8; ++q)
@@ -6438,6 +6450,17 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // A small call on its own copies only the experts it routes to.  With another launch's experts the batched
     // kernels would split its sums another way, so it cannot take what a call before it left.  In a read of
     // several calls it copies ahead as the others do, and the copy is theirs too.
+    // STRATA_PREFETCH_VISIT: the other half was copied ahead for this layer: it becomes the buffer, and what it holds
+    // is this layer's round of experts that go ahead, as a call before would have left it (staged_)
+    bool pv_wait = false;
+    if (pv_live_ && pv_il_[1 - pv_cur_] == il) {
+        pv_cur_ = 1 - pv_cur_;
+        stage_ = pv_base_[pv_cur_];
+        staged_ = pv_set_[pv_cur_];
+        staged_il_ = il;
+        pv_il_[pv_cur_] = -1;
+        pv_wait = true;
+    }
     if (ahead) plan_ahead(L, il);
     const int n_ahead = ahead ? (int) L.ahead.size() : 0;
     // Under a freeze the staging decisions are the measured times', and those are the machine's, not the
@@ -6780,6 +6803,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         }
         const int from = mine && kept < 0 ? 1 : 0;
         holds = early ? 0 : kept;
+        // the copy ahead into this half (STRATA_PREFETCH_VISIT) is done before a round reads the half or is staged into it
+        if (pv_wait && n_round > 0) ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_pv_[pv_cur_], 0), "expert staging");
         for (int turn = 0; turn < n_round; ++turn) {
             const int r = kept < 0 ? (turn + from) % n_round : turn == 0 ? kept : turn - (turn <= kept ? 1 : 0);
             const int g0 = round_[(size_t) r], m = round_[(size_t) r + 1] - g0;
@@ -6865,6 +6890,28 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     if (ahead && holds >= 0) {
         staged_.assign(group_.begin() + round_[(size_t) holds], group_.begin() + round_[(size_t) holds + 1]);
         staged_il_ = il;
+    }
+    if (pv_live_) {
+        // this half's last reader so far
+        ck(cudaEventRecord((cudaEvent_t) ev_pv_free_[pv_cur_], cs(st_)), "expert staging");
+        // the next visit's experts that go ahead, into the other half, once its last reader is done
+        const int j = pv_next_, o = 1 - pv_cur_;
+        if (ahead && j >= 0 && j < n_layer_ && j != il && pv_il_[o] != j && layers_[(size_t) j].moe) {
+            Layer& J = layers_[(size_t) j];
+            plan_ahead(J, j);
+            if (!J.ahead.empty()) {
+                uint8_t* const cur = stage_;
+                const int had_il = staged_il_;
+                stage_ = pv_base_[o];
+                ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_pv_free_[o], 0), "expert staging");
+                stage(J, J.ahead.data(), (int) J.ahead.size(), up_);
+                ck(cudaEventRecord((cudaEvent_t) ev_pv_[o], cs(up_)), "expert staging");
+                stage_ = cur;
+                staged_il_ = had_il;
+                pv_il_[o] = j;
+                pv_set_[o] = J.ahead;
+            }
+        }
     }
 }
 
@@ -8146,8 +8193,10 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     // a call's carried rows reach a later card through eval(), which the card before takes such calls through below
     if (pass_ && carry_rows() > 0) throw std::logic_error("read: a later card's carried rows come through eval()");
     // co-reads go through the layers in packs whatever the experts: one by one their calls would wait as long
+    // STRATA_PREFETCH_VISIT: a read of one call goes by read_groups() too, where the visits copy ahead
     if (n_co == 0 &&
-        (n_calls == 1 || !mmq_ || all_cached() || all < opt_.stage_ahead || !(reads_by_layer() || groups))) {
+        ((n_calls == 1 && !(pv_mode_ && groups)) || !mmq_ || all_cached() || all < opt_.stage_ahead ||
+         !(reads_by_layer() || groups))) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.
@@ -8402,8 +8451,35 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
     }
     g = std::max(g, 1);
     int visits = 0;
-    for (int il = lo_; il < hi_; il = next_layer(il)) ++visits;
+    std::vector<int> order;   // the visits' layers, in order (STRATA_PREFETCH_VISIT)
+    for (int il = lo_; il < hi_; il = next_layer(il)) {
+        ++visits;
+        order.push_back(il);
+    }
     const int groups = (n_calls + g - 1) / g, steps = groups * visits;
+    // STRATA_PREFETCH_VISIT: the next visit of a layer with experts after visit v of group k, as a layer, or -1
+    const bool pv = pv_ok_ && stage_lent_ && pv_off_ > 0;
+    const auto pv_after = [&](int k, int v) {
+        for (int x = v + 1; x < visits + (k + 1 < groups ? visits : 0); ++x) {
+            const int j = order[(size_t) (x % visits)];
+            if (layers_[(size_t) j].moe) return j;
+        }
+        return -1;
+    };
+    if (pv) {
+        for (Ahead& a : ahead_) {   // vram_ahead()'s groups are of the narrow buffer: gone, once their readers are done
+            if (a.il < 0) continue;
+            ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) a.read, 0), "expert staging");
+            a.il = -1;
+        }
+        pv_base_[0] = (uint8_t*) stage_map_.base;
+        pv_base_[1] = pv_base_[0] + pv_off_;
+        pv_cur_ = 0;
+        pv_il_[0] = pv_il_[1] = -1;
+        stage_ = pv_base_[0];
+        for (int h = 0; h < 2; ++h) ck(cudaEventRecord((cudaEvent_t) ev_pv_free_[h], cs(st_)), "expert staging");
+        pv_live_ = true;
+    }
     std::vector<uint8_t*> staged((size_t) n_marks, nullptr);   // the first mark's state goes through h_state_
     for (int m = 0; m < n_marks; ++m)
         if (marks[m].state && h_state_bytes_ >= card_state_bytes()) {
@@ -8416,6 +8492,13 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
         carry_at(nullptr);
         pos_ = pos0;
         shared_ahead_ = false;
+        if (pv_live_) {   // the buffer is its first half again; what either half holds is not known to a call
+            pv_live_ = false;
+            pv_next_ = -1;
+            pv_il_[0] = pv_il_[1] = -1;
+            stage_ = pv_base_[0];
+            staged_il_ = -1;
+        }
     };
     try {
         for (int k = 0; k < groups; ++k) {
@@ -8443,7 +8526,9 @@ bool Engine::read_groups(const Mark* marks, int n_marks, const std::function<boo
                     carry_at(base ? r_ + (size_t) rows_ * r_row : nullptr);
                     pos_ = call.pos;
                     tok_ = call.tok;
+                    pv_next_ = pv ? pv_after(k, v) : -1;   // the visit's first call through moe_rows() copies ahead
                     layer(il, call.m);
+                    pv_next_ = -1;
                     if (uint8_t* state = call.mark >= 0 ? marks[call.mark].state : nullptr)
                         save_run(il, call.pos + call.m, staged[(size_t) call.mark] ? staged[(size_t) call.mark] : state);
                 }

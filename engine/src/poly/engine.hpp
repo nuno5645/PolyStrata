@@ -1226,6 +1226,21 @@ protected:
     Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
     size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
     bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
+    // STRATA_PREFETCH_VISIT=1: in a prompt's read by groups (read_groups()), the staging buffer is two of its widened
+    // size, the halves taking turns: at the end of a visit's experts (moe_rows()) the next visit's experts that go
+    // ahead are copied on up_ into the other half, while the card is still on this visit and the next one's
+    // attention.  The VRAM is the expert cache's, given back after the read (narrow_stage()).
+    int pv_mode_ = 0;                             ///< STRATA_PREFETCH_VISIT
+    size_t pv_off_ = 0;                           ///< the second half's place in the buffer
+    bool pv_ok_ = false;                          ///< widen_stage() mapped both halves
+    bool pv_live_ = false;                        ///< read_groups() is taking the halves in turn
+    int pv_cur_ = 0;                              ///< the half stage_ is
+    int pv_next_ = -1;                            ///< the layer the current call copies ahead for (read_groups()), or -1
+    int pv_il_[2] = {-1, -1};                     ///< the layer whose experts a half was copied for ahead, or -1
+    std::vector<int32_t> pv_set_[2];              ///< and those experts
+    void* ev_pv_[2] = {};                         ///< marks a half's copy ahead, on up_
+    void* ev_pv_free_[2] = {};                    ///< marks a half's last read, on st_
+    uint8_t* pv_base_[2] = {};
     size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;
