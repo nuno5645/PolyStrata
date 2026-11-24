@@ -1,11 +1,11 @@
-# hp-2060: strata-poly only, Linux x64, CUDA 13.0, sm_75 only (RTX 2060), for A/B tests on one PC.
+# hp-2060: strata-poly only, Linux x64, CUDA 13.0, sm_75 + sm_86 (RTX 2060 and RTX 3060), for A/B tests on one PC.
 # Same toolchain family as the release's Linux package (Ubuntu 22.04, gcc 12, CUDA 13.0) and the same
 # configure flags as tools/packaging/build_cuda_linux.sh.
 name: hp-2060
 
 on:
   push:
-    branches: [hp-2060, hp-2060-extra, hp-2060-k, hp-2060-l]
+    branches: [hp-2060, hp-2060-extra, hp-2060-k, hp-2060-l, hp-3060]
   workflow_dispatch:
 
 concurrency:
@@ -52,7 +52,7 @@ jobs:
             -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
             -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=${{ matrix.tests }} -DSTRATA_EXPERIMENTAL_SM60=OFF \
             -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON \
-            "-DCMAKE_CUDA_ARCHITECTURES=75-real" \
+            "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
       - name: Build ${{ matrix.targets }}
         run: |
@@ -135,7 +135,7 @@ jobs:
             cp -L /usr/local/cuda/lib64/$so out/lib/ 2>/dev/null || cp -L "$(find /usr/local/cuda/ -name "$so" | head -1)" out/lib/
           done
           nv=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')
-          printf '{"branch":"%s","commit":"%s","cuda":"%s","archs":"75-real","host":"ubuntu22.04 gcc-12"}\n' \
+          printf '{"branch":"%s","commit":"%s","cuda":"%s","archs":"75-real;86-real","host":"ubuntu22.04 gcc-12"}\n' \
             "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "$nv" > out/BUILD.json
           cat > out/run.sh <<'SH'
           #!/bin/sh
