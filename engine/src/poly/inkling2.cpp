@@ -216,6 +216,9 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_INK_KERNEL_TABLES");
         kernel_tables_ = !(v && std::string(v) == "0");
     }
+    // A read's cuts take the experts a short answer left on their way into the cache as uploaded, and upload the
+    // ones they keep after the last of them (Engine::owe_refills()).  The same experts end in the cache.
+    owes_ = true;
 #endif
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
