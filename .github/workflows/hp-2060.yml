@@ -70,6 +70,34 @@ jobs:
           name: strata-poly-sm75-tests
           path: out
           retention-days: 14
+      - name: Spill audit (sm_75)
+        if: matrix.kind == 'engine'
+        run: |
+          # every kernel of the binary as built for sm_75: registers, stack frame (spills and local arrays), .local
+          mkdir -p audit
+          python3 tools/check_cuda_spills.py --list --cuobjdump /usr/local/cuda/bin/cuobjdump build/strata-poly \
+            > audit/resource-usage.csv
+          python3 - <<'PY'
+          import csv
+          rows = list(csv.DictReader(open("audit/resource-usage.csv")))
+          bad = [r for r in rows if int(r["stack"]) > 0 or int(r["local"]) > 0 or int(r["reg"]) >= 255]
+          bad.sort(key=lambda r: (-int(r["stack"]), r["kernel"]))
+          with open("audit/spills.txt", "w") as f:
+              f.write("%d of %d sm_75 kernel instances with STACK > 0, LOCAL > 0 or REG >= 255\n" % (len(bad), len(rows)))
+              f.write("%5s %6s %6s  %s\n" % ("REG", "STACK", "LOCAL", "kernel"))
+              for r in bad:
+                  f.write("%5s %6s %6s  %s\n" % (r["reg"], r["stack"], r["local"], r["kernel"]))
+          PY
+          cat audit/spills.txt
+          python3 tools/check_cuda_spills.py --cuobjdump /usr/local/cuda/bin/cuobjdump build/strata-poly \
+            > audit/guard.txt 2>&1 || true
+          tail -5 audit/guard.txt
+      - uses: actions/upload-artifact@v4
+        if: matrix.kind == 'engine'
+        with:
+          name: strata-poly-sm75-spill-audit
+          path: audit
+          retention-days: 14
       - name: Stage
         if: matrix.kind == 'engine'
         run: |
