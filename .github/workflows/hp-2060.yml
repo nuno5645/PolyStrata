@@ -94,6 +94,27 @@ jobs:
                   f.write("%5s %6s %6s  %s\n" % (r["reg"], r["stack"], r["local"], r["kernel"]))
           PY
           cat audit/spills.txt
+          # the local-memory instructions in each kernel's sm_75 SASS (LDL / STL: spills, local arrays, a parameter
+          # struct indexed by a register), the kernels with any, most first
+          /usr/local/cuda/bin/cuobjdump -sass build/strata-poly > audit/sass.txt
+          python3 - <<'PY'
+          import re, subprocess
+          counts, cur = {}, None
+          for line in open("audit/sass.txt"):
+              m = re.match(r"\s*Function : (\S+)", line)
+              if m:
+                  cur = m.group(1); counts.setdefault(cur, [0, 0]); continue
+              if cur and re.search(r"\bLDL\b|\bLDL\.", line): counts[cur][0] += 1
+              if cur and re.search(r"\bSTL\b|\bSTL\.", line): counts[cur][1] += 1
+          bad = sorted(((l + s, l, s, f) for f, (l, s) in counts.items() if l + s), reverse=True)
+          names = subprocess.run(["c++filt"], input="\n".join(f for *_, f in bad) + "\n", capture_output=True, text=True).stdout.splitlines()
+          with open("audit/local_ops.txt", "w") as o:
+              o.write("%d of %d sm_75 kernels with LDL/STL in their SASS\n%5s %5s  %s\n" % (len(bad), len(counts), "LDL", "STL", "kernel"))
+              for (t, l, s, f), n in zip(bad, names):
+                  o.write("%5d %5d  %s\n" % (l, s, n))
+          PY
+          rm audit/sass.txt
+          head -60 audit/local_ops.txt
           python3 tools/check_cuda_spills.py --cuobjdump /usr/local/cuda/bin/cuobjdump build/strata-poly \
             > audit/guard.txt 2>&1 || true
           tail -5 audit/guard.txt
