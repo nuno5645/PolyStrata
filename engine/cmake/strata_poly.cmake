@@ -490,6 +490,10 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   add_executable(poly_cpu_x4_test src/poly/cpu_x4_test.cpp src/poly/cpu_experts.cpp)
   target_link_libraries(poly_cpu_x4_test PRIVATE strata_quant Threads::Threads)
   add_test(NAME poly_cpu_x4_test COMMAND poly_cpu_x4_test)
+  # STRATA_LOOKUP_NINFER's lookup against NInfer's lookup_draft(), without a card or a model
+  add_executable(poly_ngram_lookup_test src/poly/ngram_lookup_test.cpp)
+  target_include_directories(poly_ngram_lookup_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME poly_ngram_lookup_test COMMAND poly_ngram_lookup_test)
   # the card's MXFP4 product against ggml's dequantizer on random blocks, without a model; needs a card, run by hand
   if(TARGET ggml-base)
     add_executable(poly_mxfp4_test src/poly/mxfp4_test.cu)

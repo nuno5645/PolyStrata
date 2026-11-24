@@ -15,6 +15,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/ngram_lookup.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <algorithm>
@@ -389,6 +390,30 @@ struct Session {
     bool look;                            // guess from repeats
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
+    // STRATA_LOOKUP_NINFER=1: NInfer's context lookup first (strata/spec/ngram_lookup.hpp): the tail of
+    // STRATA_LOOKUP_N tokens (8; down to STRATA_LOOKUP_NMIN, the same by default) looked for in the whole
+    // conversation, the newest occurrence, and up to STRATA_LOOKUP_D tokens that followed it (7) verified in one
+    // window of that many plus one whatever the match's length, as NInfer's --lookup-ngram 8 --draft-tokens 7 does.
+    // The window is the largest of 2, 4, 8 (16) that holds them, so that no other size is recorded as graphs
+    // (STRATA_LOOKUP_ANY_T=1: any size).  Where it finds nothing, the repeats and the policy above as before.  Only the
+    // proposals change: every token kept is the one the model picked, as with any window.
+    struct NinferLookup {
+        bool on = false, any_t = false;
+        int d = 7;
+        strata::spec::NgramLookup look;
+        NinferLookup() {
+            const auto env = [](const char* k, int def) {
+                const char* v = std::getenv(k);
+                return v && *v ? std::atoi(v) : def;
+            };
+            on = env("STRATA_LOOKUP_NINFER", 0) == 1;
+            any_t = env("STRATA_LOOKUP_ANY_T", 0) == 1;
+            look.n = std::clamp(env("STRATA_LOOKUP_N", 8), 1, 64);
+            look.min_n = std::clamp(env("STRATA_LOOKUP_NMIN", look.n), 1, look.n);
+            d = std::clamp(env("STRATA_LOOKUP_D", 7), 1, strata::spec::DraftPolicy::kMaxT - 1);
+        }
+    } nf;
+    long long nf_rounds = 0, nf_proposed = 0, nf_right = 0;   // its rounds, for the log line after an answer
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
@@ -539,6 +564,8 @@ struct Session {
             repeats.reset();
             repeats.append(history.data(), history.size());
         }
+        nf.look.reset();
+        const long long nf_rounds0 = nf_rounds, nf_proposed0 = nf_proposed, nf_right0 = nf_right;
         const auto pick = [&](const float* logits) {
             picked_from = logits;
             if (follow && r.produced < (int64_t) follow->size()) return (*follow)[(size_t) r.produced];
@@ -568,20 +595,36 @@ struct Session {
                 // t goes into the model now, and with it guesses at what follows when there are any that pay
                 const Clock::time_point round = Clock::now();
                 const bool room = engine.pos() + most <= engine.max_context();
-                const int offered = look && room ? repeats.propose(most - 1, w + 1) : 0;
-                const int match = repeats.last_match();
-                const int widest = match >= kCopyMatch ? most : std::min(most, block_window);   // this round's window
+                // STRATA_LOOKUP_NINFER: NInfer's lookup, verified whatever its match's length (NinferLookup)
+                int nf_k = nf.on && room && most > 1
+                               ? nf.look.propose(history.data(), history.size(), std::min(nf.d, most - 1), w + 1)
+                               : 0;
+                if (nf_k > 0 && !nf.any_t) {   // the window: 2, 4, 8 or 16 tokens, the largest that the proposal fills
+                    int p = 1;
+                    while (p * 2 <= nf_k + 1 && p * 2 <= strata::spec::DraftPolicy::kMaxT) p *= 2;
+                    nf_k = p - 1;
+                }
+                const int offered = nf_k > 0 ? nf_k : look && room ? repeats.propose(most - 1, w + 1) : 0;
+                const int match = nf_k > 0 ? nf.look.last_match : repeats.last_match();
+                // this round's window
+                const int widest = nf_k > 0 ? nf_k + 1 : match >= kCopyMatch ? most : std::min(most, block_window);
                 const int k = std::min(offered, widest - 1);
                 // A repeat that fills the window, from a match of a length that has been right nine times in ten,
                 // is taken as it is: the block would mostly say the same, and asking it takes time.  Otherwise the
                 // block guesses, each guess from the one before, while a guess more pays (Guesses).
-                const bool blocks = engine.drafts() && room && !(k == widest - 1 && policy.lookup_rate(match) >= 0.9);
+                const bool blocks = nf_k == 0 && engine.drafts() && room &&
+                                    !(k == widest - 1 && policy.lookup_rate(match) >= 0.9);
                 const bool ask = guesses.begin(blocks, policy);
                 // the round's time, as the policy counts it: a window of `in` tokens wrote n of them
                 const auto count = [&](int in, int n) {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
                 };
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
+                if (nf_k > 0) {
+                    use.lookup = true;
+                    use.t = nf_k + 1;
+                    use.pad = 0;
+                }
                 if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, block_window) - 1 && guesses.wants(n_d); from = d[n_d++]) {
@@ -633,11 +676,21 @@ struct Session {
                 kept.read(w, right + 1);
                 r.guessed += use.t - 1;
                 r.guessed_right += right + (more ? 0 : 1);
+                if (nf_k > 0) {
+                    ++nf_rounds;
+                    nf_proposed += use.t - 1;
+                    nf_right += right + (more ? 0 : 1);
+                }
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
                 if (!more) break;
             }
         }
         r.decode_ms = ms_since(t0);
+        if (nf.on && nf_rounds > nf_rounds0)
+            std::fprintf(stderr, "strata-poly: STRATA_LOOKUP_NINFER: %lld windows, %lld of %lld guesses right (%lld, %lld "
+                                 "of %lld in all)\n",
+                         nf_rounds - nf_rounds0, nf_right - nf_right0, nf_proposed - nf_proposed0, nf_rounds, nf_right,
+                         nf_proposed);
         return r;
     }
 };
