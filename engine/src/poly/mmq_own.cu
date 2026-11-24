@@ -105,10 +105,11 @@ bool whole_tiles(int t, int64_t cols) {
     return cols % 256 == 0;
 }
 
+int tile_wk(int t, int64_t cols) { return (t == 42 || ((t == 20 || t == 40) && cols % 256 != 0)) ? 128 : 256; }
+
 // shared memory of a block (the kernel's own sum: BN weight rows of WK + 8 halves, BM = 64 rows of XK + 8 = 136)
-size_t tile_bytes(int t, int64_t cols) {
-    const int wk = (t == 42 || ((t == 20 || t == 40) && cols % 256 != 0)) ? 128 : 256;
-    return (size_t) kTileRows * (wk + 8) * 2 + (size_t) 64 * (128 + 8) * 2;
+size_t tile_bytes(int t, int64_t cols, int bn = kTileRows) {
+    return (size_t) bn * (tile_wk(t, cols) + 8) * 2 + (size_t) 64 * (128 + 8) * 2;
 }
 #else
 // RDNA: Q2_0, IQ4_NL, NVFP4 and Q8_0 in the 128-value tiles whatever the row length (gemm_iq_f16_grouped's HIP lanes);
@@ -190,8 +191,10 @@ bool grouped(int t, int64_t rows, int64_t cols) {
     return !blas_only() && c.shared > 0 && dequantized(t) && rows % kTileRows == 0 && whole_tiles(t, cols) &&
            tile_bytes(t, cols) <= c.shared;
 #else
-    return !blas_only() && c.major >= 7 && dequantized(t) && rows % kTileRows == 0 && whole_tiles(t, cols) &&
-           tile_bytes(t, cols) <= c.shared;
+    // STRATA_T75_TILE: blocks of 64 weight rows where the 128-row tile of 256 values does not fit (Turing's 64 KiB)
+    const int bn = tile_wk(t, cols) == 256 ? kernels::gemm_iq_f16_block_rows(256, c.shared) : kTileRows;
+    return !blas_only() && c.major >= 7 && dequantized(t) && rows % bn == 0 && whole_tiles(t, cols) &&
+           tile_bytes(t, cols, bn) <= c.shared;
 #endif
 }
 

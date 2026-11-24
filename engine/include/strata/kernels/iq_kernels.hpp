@@ -202,6 +202,13 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
 /// Y FP32 (ldy).  FP16 tensor cores, FP32 sums.  false: not launched (shape or type not covered).  CUDA only.
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream);
+/// STRATA_T75_TILE (read once): 0 off (the default); 1 the WK 256 tiles in blocks of 64 weight rows and 4 warps, 2 the
+/// same with 8 warps, where the 128-row tile does not fit a block's shared memory (Turing).  Each output value is the
+/// same sum in the same order as in the 128-row tile.
+int gemm_iq_f16_t75_tile();
+/// The weight rows of gemm_iq_f16_grouped's block for a tile of wk values (128 or 256) on a card with this much shared
+/// memory a block (opt-in): 128, or 64 where STRATA_T75_TILE is on and the 128-row tile does not fit.
+int gemm_iq_f16_block_rows(int wk, size_t shared_optin);
 /// The same products on the int8 tensor cores, for matrices of any number of rows (src/kernels/cuda/i8_mma.cuh):
 /// the weights decoded to int8 a tile at a time, the activations int8 with a scale per 32 values, FP32 sums.
 /// CUDA, Ampere and newer (Turing with gemm_iq_i8_turing()).  gemm_iq_i8_takes: the current card runs it for K columns of type ty (K a multiple of 256,

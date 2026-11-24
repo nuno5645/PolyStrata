@@ -400,6 +400,12 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
     set_tests_properties(poly_mmq_paths_test_blas PROPERTIES ENVIRONMENT "STRATA_POLY_PROMPT_BLAS=1")
     set_tests_properties(poly_mmq_paths_test_x2 PROPERTIES ENVIRONMENT "STRATA_PREFILL_NVFP4=w4a4x2")
     set_tests_properties(poly_mmq_paths_test_w4a8 PROPERTIES ENVIRONMENT "STRATA_PREFILL_NVFP4=w4a8")
+    # STRATA_T75_TILE: Turing's 64-row tiles (4 and 8 warps) in place of the BLAS path
+    add_test(NAME poly_mmq_paths_test_t75 COMMAND poly_mmq_paths_test)
+    add_test(NAME poly_mmq_paths_test_t75w8 COMMAND poly_mmq_paths_test)
+    set_tests_properties(poly_mmq_paths_test_t75 poly_mmq_paths_test_t75w8 PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(poly_mmq_paths_test_t75 PROPERTIES ENVIRONMENT "STRATA_T75_TILE=1")
+    set_tests_properties(poly_mmq_paths_test_t75w8 PROPERTIES ENVIRONMENT "STRATA_T75_TILE=2")
   endif()
   # LFM2's short convolution against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_shortconv_test src/poly/shortconv_test.cu src/poly/kernels.cu)
