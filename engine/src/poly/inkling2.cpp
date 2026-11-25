@@ -840,10 +840,29 @@ void Inkling2::alloc_caches() {
     keep_ = std::min(window_, ring_);
     float* st = state_;
     size_t ring_at = 0;
-    for (Slot& s : slots_) {
+    // STRATA_LAST_LOOP=1 (transformers' recurrent_kv_cache_mode "last_loop", PR 51161): a core full layer's passes
+    // share one cache.  The passes run one after the other and each writes its rows before it reads them, so a pass
+    // reads the rows of earlier calls as the last pass left them and its own call's rows as it wrote them; the
+    // convolutions' past inputs stay a pass's own.  Halves the core's full-layer caches (2 of the Mini's 4 full layers).
+    static const bool last_loop = [] {
+        const char* v = std::getenv("STRATA_LAST_LOOP");
+        return v && std::atoi(v) != 0;
+    }();
+    if (last_loop && ring_maps_.empty())
+        std::fprintf(stderr, "strata-poly: STRATA_LAST_LOOP: the core's full layers keep one cache for their %d passes\n",
+                     n_pass_);
+    for (size_t si = 0; si < slots_.size(); ++si) {
+        Slot& s = slots_[si];
         if (!runs(s.il)) continue;
         s.past = st;
         st += past_floats();
+        if (last_loop && !blocks_[(size_t) s.il].swa && (int) si >= n_layer_) {
+            const Slot& first = slots_[(size_t) slot_of(s.il, 0)];
+            s.keys = first.keys;
+            s.vals = first.vals;
+            s.shared = true;
+            continue;
+        }
         if (blocks_[(size_t) s.il].swa && ring_vmm_) {
             // reserved for the large ring, mapped for the one there is now (ring_resize() maps and unmaps the rest)
             for (uint16_t** to : {&s.keys, &s.vals}) {
@@ -2007,7 +2026,7 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
 // The full slots' rows of the whole context, keys then values a slot.
 size_t Inkling2::card_row_bytes() const {
     size_t n = 0;
-    for (const Slot& s : slots_) n += blocks_[(size_t) s.il].swa ? 0 : 1;
+    for (const Slot& s : slots_) n += blocks_[(size_t) s.il].swa || s.shared ? 0 : 1;
     return n * 2 * kv_row();
 }
 
@@ -2017,7 +2036,7 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
     const size_t row = kv_row();
     for (const Slot& s : slots_) {
-        if (blocks_[(size_t) s.il].swa || !s.keys || n == 0) continue;
+        if (blocks_[(size_t) s.il].swa || s.shared || !s.keys || n == 0) continue;
         for (const uint16_t* cache : {s.keys, s.vals}) {
             ck(cudaMemcpy(dst, (const uint8_t*) cache + (size_t) first * row, (size_t) n * row,
                           cudaMemcpyDeviceToHost),
@@ -2034,7 +2053,7 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
     const size_t row = kv_row();
     for (const Slot& s : slots_) {
-        if (blocks_[(size_t) s.il].swa || !s.keys || n == 0) continue;
+        if (blocks_[(size_t) s.il].swa || s.shared || !s.keys || n == 0) continue;
         for (uint16_t* cache : {s.keys, s.vals}) {
             ck(cudaMemcpy((uint8_t*) cache + (size_t) first * row, src + (size_t) (first - from) * row,
                           (size_t) n * row, cudaMemcpyHostToDevice),

@@ -122,6 +122,7 @@ private:
         uint16_t* keys = nullptr;   ///< fp16, n_kv * head_dim a row: a row a position, or a window layer's ring
         uint16_t* vals = nullptr;
         float* past = nullptr;      ///< the convolutions' last inputs: K, V, the attention's output, the FFN's
+        bool shared = false;        ///< STRATA_LAST_LOOP: a later pass's full-layer caches are its layer's first pass's
     };
 
     int slot_of(int il, int pass) const {
