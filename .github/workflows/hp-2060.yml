@@ -5,7 +5,7 @@ name: hp-2060
 
 on:
   push:
-    branches: [hp-2060, hp-2060-extra, hp-2060-k, hp-2060-l, hp-3060]
+    branches: [hp-2060, hp-2060-extra, hp-2060-k, hp-2060-l, hp-3060, hp-3060-loopcd]
   workflow_dispatch:
 
 concurrency:
