@@ -335,10 +335,28 @@ void Inkling2::load_geometry() {
     const MetaValue* pattern = find("attention.sliding_window_pattern");
     need(pattern && pattern->type == MetaType::ARRAY && (int) pattern->items.size() >= n_layer_,
          "attention.sliding_window_pattern has no value for every layer");
-    slots_.assign((size_t) n_layer_ + (size_t) (n_pass_ - 1) * (core_end_ - core_start_), Slot{});
+    if (const char* v = std::getenv("STRATA_LOOPCD"); v && *v) {
+        lcd_ = true;
+        lcd_w_ = (float) std::atof(v);
+        const char* f = std::getenv("STRATA_LOOPCD_FIXED");
+        lcd_adaptive_ = !(f && f[0] == '1');
+        const char* s = std::getenv("STRATA_LOOPCD_SHOW");
+        lcd_show_ = s && s[0] == '1';
+        need(core_end_ / blk_ == kBlocks - 1 && n_layer_ - core_end_ == blk_ && (core_end_ - core_start_) / blk_ == 2,
+             "STRATA_LOOPCD: the loop is not Inkling 2 Mini's (a core of two blocks, then one block)");
+        need(opt_.draft_model.empty(), "STRATA_LOOPCD: not with a drafter");
+        std::fprintf(stderr, "strata-poly: STRATA_LOOPCD: omega %.3f%s%s (a reference coda of %d layers on pass 1's state)\n",
+                     lcd_w_, lcd_adaptive_ ? " adaptive" : " fixed", lcd_show_ ? ", SHOW: the reference's logits" : "",
+                     n_layer_ - core_end_);
+    }
+    slots_.assign((size_t) n_layer_ + (size_t) (n_pass_ - 1) * (core_end_ - core_start_) +
+                      (lcd_ ? (size_t) (n_layer_ - core_end_) : 0),
+                  Slot{});
     for (int il = 0; il < n_layer_; ++il)
         for (int p = 0; p < (il >= core_start_ && il < core_end_ ? n_pass_ : 1); ++p)
             slots_[(size_t) slot_of(il, p)].il = il;
+    if (lcd_)
+        for (int il = core_end_; il < n_layer_; ++il) slots_[(size_t) slot_of(il, n_pass_)].il = il;
     swa_.assign((size_t) n_layer_, false);
     // an Unsloth file lists the applications (48 for Inkling 2 Mini), so a layer's value is its first application's;
     // index il there would be right only while the pattern's period divides the loop's length
@@ -875,6 +893,14 @@ void Inkling2::assign_scratch() {
     std::copy(bl_, bl_ + kBlocks, home_);
     home_[kBlocks] = bank_;
     home_[kBlocks + 1] = bank_out_;
+    if (lcd_) {
+        for (int j = 0; j < kRefRows; ++j) home_[kBlocks + 2 + j] = lref_[j] = fbuf(e);
+        lref_h_ = fbuf(e);
+        if (!lref_lg_) {
+            lref_lg_rows_ = std::max({opt_.window, 2 * (opt_.batch + 1), 1});
+            lref_lg_ = (float*) dmalloc((size_t) lref_lg_rows_ * n_vocab_ * sizeof(float), "LoopCD");
+        }
+    }
     for (float*& b : in_) b = fbuf(e);
     for (float*& b : xin_) b = fbuf(e);
     for (float*& b : msg_) b = fbuf(e);
@@ -1353,7 +1379,7 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
 void Inkling2::layer_head(Layer& L, int il, int n) {
     // A call starts at its card's first layer.  A card that starts at the loop's first layer comes back to it for
     // each later pass, so it keeps the pass there: next_layer() leaves it 0 after the last pass.
-    if (il == lo_ && il != core_start_) pass_ = 0;
+    if (il == lo_ && il != core_start_) pass_ = 0, ref_ = false;
     Block& B = blocks_[(size_t) il];
     if (ds_file_) {   // the drafter's features: the inputs of three layer runs
         const int visit = visit_of(il, pass_of(il));
@@ -1386,6 +1412,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     const int core_block = core_start_ / blk_;
     const int n_bank = (core_end_ - core_start_) / blk_ - 1;
     if (il == core_start_ && pass_ > 0) {
+        if (lcd_ && pass_ == 1) {   // LoopCD: pass 1's state, for the reference coda
+            copy_rows(bl_[core_block + 1], lref_[0], n);
+            copy_rows(r_, lref_[1], n);
+        }
         if (n_bank > 0) copy_rows(bl_[core_block + 1], bank_, n);
         copy_rows(r_, bank_out_, n);
         copy_rows(bl_[core_block], r_, n);
@@ -1400,10 +1430,19 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         }
     }
 
+    // LoopCD's reference coda starts from pass 1's state; the main coda's is kept for output_rows()
+    if (ref_ && il == core_end_) {
+        copy_rows(bl_[kBlocks - 2], lref_[2], n);
+        copy_rows(bl_[kBlocks - 1], lref_[3], n);
+        copy_rows(r_, lref_[4], n);
+        copy_rows(lref_[0], bl_[kBlocks - 2], n);
+        copy_rows(lref_[1], r_, n);
+    }
+
     // the attention's inputs: a mix of the streams so far, one for a window layer and one each for Q, K and V for
     // a full one
     const float* in[3] = {r_, r_, r_};
-    const bool looped = pass_of(il) > 0;   // a later pass of the core: its inputs take the pass before's messages
+    const bool looped = il < core_end_ && pass_of(il) > 0;   // a later pass of the core: its inputs take the pass before's messages
     // a window layer outside a later pass has one input, normed in the mix's launch
     const bool mix_normed = il > 0 && B.swa && !looped && sum_threads(n_embd_) == 1024;
     if (il > 0) {
@@ -1806,6 +1845,7 @@ void Inkling2::tail_rows(int il, int n) {
 // After the core's last layer, its first again, until the passes are done.  Called for every layer a call runs,
 // replayed or not, so the pass is right for the recordings' keys.
 int Inkling2::next_layer(int il) {
+    if (il < core_end_) ref_ = false;
     if (il == core_end_ - 1) {
         if (pass_ + 1 < n_pass_) {
             ++pass_;
@@ -1813,11 +1853,16 @@ int Inkling2::next_layer(int il) {
         }
         pass_ = 0;
     }
+    if (lcd_ && il == n_layer_ - 1) {   // LoopCD: the coda again, as the reference
+        ref_ = !ref_;
+        if (ref_) return core_end_;
+    }
     return il + 1;
 }
 
 // next_layer()'s answer, with the pass left as it is (the guesses ahead, Engine::guess_layer())
 int Inkling2::peek_next_layer(int il) const {
+    if (lcd_ && il == n_layer_ - 1 && !ref_) return core_end_;
     return il == core_end_ - 1 && pass_ + 1 < n_pass_ ? core_start_ : il + 1;
 }
 
@@ -1829,19 +1874,42 @@ int Inkling2::head_key(int il, int n) const {
 
 // A tail's recordings: one a pass of the core and a sequence, whose state is in them (the heads' are the sequence's
 // own: Engine::Seq::heads).
-int Inkling2::tail_key(int il, int) const { return pass_of(il) + n_pass_ * bound(); }
+int Inkling2::tail_key(int il, int) const { return pass_of(il) + (n_pass_ + 1) * bound(); }
 
 void Inkling2::output_rows(int first, int rows, float* h) {
     const size_t at = (size_t) first * n_embd_;
     float* mixed[1] = {mixf_ + at};
+    if (lcd_) {   // the streams are the reference coda's: its readout to lref_h_, the main one's from lref_[2..4]
+        ink_mix(streams_of(kBlocks, at), fp(out_query_), 1, mixed, n_embd_, rows, st_);
+        rms_norm(mixf_ + at, fp(out_norm_), lref_h_, n_embd_, rows, rms_eps_, st_);
+        InkStates s;
+        for (int i = 0; i < kBlocks - 2; ++i) s.p[s.n++] = bl_[i] + at;
+        for (int j = 2; j < kRefRows; ++j) s.p[s.n++] = lref_[j] + at;
+        ink_mix(s, fp(out_query_), 1, mixed, n_embd_, rows, st_);
+        rms_norm(mixf_ + at, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
+        lref_rows_ = rows;
+        return;
+    }
     ink_mix(streams_of((n_layer_ - 1) / blk_ + 1, at), fp(out_query_), 1, mixed, n_embd_, rows, st_);
     rms_norm(mixf_ + at, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
 }
 
 // The scores' soft cap, and the output matrix's rows past the vocabulary out of every pick.
 void Inkling2::finish_logits(float* logits, int rows) {
-    if (softcap_ > 0.f || n_unpadded_ < n_vocab_)
-        ink_softcap(logits, n_unpadded_, n_vocab_, rows, softcap_ > 0.f ? softcap_ : INFINITY, st_);
+    const float cap = softcap_ > 0.f ? softcap_ : INFINITY;
+    if (softcap_ > 0.f || n_unpadded_ < n_vocab_) ink_softcap(logits, n_unpadded_, n_vocab_, rows, cap, st_);
+    if (!lcd_ || rows <= 0 || lref_rows_ < rows) return;
+    // LoopCD: the reference readout's logits for the same rows (the last `rows` output_rows() made), soft capped,
+    // and the contrast
+    const float* hb = lref_h_ + (size_t) (lref_rows_ - rows) * n_embd_;
+    for (int r0 = 0; r0 < rows; r0 += lref_lg_rows_) {
+        const int m = std::min(rows - r0, lref_lg_rows_);
+        lin(output_, hb + (size_t) r0 * n_embd_, lref_lg_, m);
+        ink_softcap(lref_lg_, n_unpadded_, n_vocab_, m, cap, st_);
+        ink_loopcd(logits + (size_t) r0 * n_vocab_, lref_lg_, n_unpadded_, n_vocab_, m, lcd_w_, lcd_adaptive_,
+                   lcd_show_, st_);
+    }
+    lref_rows_ = 0;
 }
 
 // What llama.cpp's MoE graph does for this model: sigmoid gates, the n_used largest of gate + bias, and weights
@@ -1946,13 +2014,17 @@ size_t Inkling2::extra_bytes() const {
 
 // On a layer split the next card goes on from these and r_: what crosses is the stream, the four blocks' starts the
 // mixes read and the loop's bank (64.5 KB a token at Inkling 2 Mini's width).
-float* Inkling2::carried(int i) { return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : bank_out_; }
+float* Inkling2::carried(int i) {
+    return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : i == kBlocks + 1 ? bank_out_ : lref_[i - kBlocks - 2];
+}
 
 void Inkling2::carry_at(float* at) {
     const auto place = [&](int i) { return at ? at + (size_t) i * rows_ * n_embd_ : home_[i]; };
     for (int i = 0; i < kBlocks; ++i) bl_[i] = place(i);
     bank_ = place(kBlocks);
     bank_out_ = place(kBlocks + 1);
+    if (lcd_)
+        for (int j = 0; j < kRefRows; ++j) lref_[j] = place(kBlocks + 2 + j);
 }
 
 void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) { save_slots(il, -1, pos, dst); }

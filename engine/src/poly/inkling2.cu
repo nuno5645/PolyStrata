@@ -3228,6 +3228,76 @@ void ink_store_ring(const float* x, uint16_t* cache, int n, int64_t pos, int row
     launched("ink_store_ring");
 }
 
+__device__ __forceinline__ void ink_top2_merge(float& a1, float& a2, float b1, float b2) {
+    const float hi = fmaxf(a1, b1), lo = fminf(a1, b1);
+    a2 = fmaxf(lo, fmaxf(a2, b2));
+    a1 = hi;
+}
+
+__global__ void ink_loopcd_kernel(float* z, const float* z1, int n_keep, int n_all, float omega, int adaptive,
+                                  int show) {
+    z += (size_t) blockIdx.x * n_all;
+    z1 += (size_t) blockIdx.x * n_all;
+    __shared__ float s1[32], s2[32];
+    __shared__ float w_sh;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    if (show) {
+        for (int j = threadIdx.x; j < n_keep; j += blockDim.x) z[j] = z1[j];
+        return;
+    }
+    float w = omega;
+    if (adaptive) {
+        float a1 = -INFINITY, a2 = -INFINITY;
+        for (int j = threadIdx.x; j < n_keep; j += blockDim.x) {
+            const float v = z[j];
+            if (v > a1) a2 = a1, a1 = v;
+            else if (v > a2) a2 = v;
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float b1 = __shfl_xor_sync(0xffffffffu, a1, o), b2 = __shfl_xor_sync(0xffffffffu, a2, o);
+            ink_top2_merge(a1, a2, b1, b2);
+        }
+        if (lane == 0) s1[warp] = a1, s2[warp] = a2;
+        __syncthreads();
+        if (warp == 0) {
+            a1 = lane < warps ? s1[lane] : -INFINITY;
+            a2 = lane < warps ? s2[lane] : -INFINITY;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float b1 = __shfl_xor_sync(0xffffffffu, a1, o), b2 = __shfl_xor_sync(0xffffffffu, a2, o);
+                ink_top2_merge(a1, a2, b1, b2);
+            }
+            if (lane == 0) s1[0] = a1, s2[0] = a2;
+        }
+        __syncthreads();
+        const float m1 = s1[0], m2 = s2[0];
+        __syncthreads();
+        float sum = 0.f;
+        for (int j = threadIdx.x; j < n_keep; j += blockDim.x) sum += __expf(z[j] - m1);
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) s1[warp] = sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < warps; ++i) t += s1[i];
+            const float p1 = 1.f / t, p2 = __expf(m2 - m1) / t;
+            w_sh = omega * (1.f - (p1 - p2));
+        }
+        __syncthreads();
+        w = w_sh;
+    }
+    for (int j = threadIdx.x; j < n_keep; j += blockDim.x) {
+        const float v = z[j];
+        z[j] = v + w * (v - z1[j]);
+    }
+}
+
+void ink_loopcd(float* z, const float* z1, int n_keep, int n_all, int rows, float omega, bool adaptive, bool show,
+                void* stream) {
+    if (rows <= 0) return;
+    ink_loopcd_kernel<<<rows, 1024, 0, cs(stream)>>>(z, z1, n_keep, n_all, omega, adaptive ? 1 : 0, show ? 1 : 0);
+    launched("ink_loopcd");
+}
+
 void ink_softcap(float* logits, int n_keep, int n_all, int rows, float cap, void* stream) {
     if (rows <= 0) return;
     ink_softcap_kernel<<<grid((size_t) rows * n_all, 256), 256, 0, cs(stream)>>>(logits, n_keep, n_all, rows, cap);

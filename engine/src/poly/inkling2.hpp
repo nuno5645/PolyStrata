@@ -69,7 +69,7 @@ protected:
     bool reads_by_layer() const override { return false; }
     // A call's residual streams and the core's bank from one layer run to the next: read() takes the calls through
     // the runs a group at a time.  Not with the drafter, whose taps of three runs are a call's too.
-    int carry_rows() const override { return ds_file_ ? 0 : kBlocks + 2; }
+    int carry_rows() const override { return ds_file_ ? 0 : kBlocks + 2 + (lcd_ ? kRefRows : 0); }
     // A read gives up hundreds of cached experts (the carried rows, the wider staging buffer) and the next request
     // takes them back: with a copy of each kept in pinned memory they need no copy back from the card, and none goes
     // to the card through the two pinned buffers, whose turns wait behind the next layer run's experts (prestage).
@@ -125,10 +125,16 @@ private:
     };
 
     int slot_of(int il, int pass) const {
-        return pass == 0 ? il : n_layer_ + (pass - 1) * (core_end_ - core_start_) + (il - core_start_);
+        const int core = core_end_ - core_start_;
+        return pass == 0       ? il
+               : il >= core_end_ ? n_layer_ + (n_pass_ - 1) * core + (il - core_end_)   // LoopCD's reference coda
+                                 : n_layer_ + (pass - 1) * core + (il - core_start_);
     }
-    /// The pass layer il's application under way is of: the core's pass_, and 0 outside the core.
-    int pass_of(int il) const { return il >= core_start_ && il < core_end_ ? pass_ : 0; }
+    /// The pass layer il's application under way is of: the core's pass_, n_pass_ for LoopCD's reference coda (ref_),
+    /// and 0 elsewhere.
+    int pass_of(int il) const {
+        return il >= core_start_ && il < core_end_ ? pass_ : ref_ && il >= core_end_ ? n_pass_ : 0;
+    }
     size_t past_floats() const { return (size_t) (taps_ - 1) * (2 * (size_t) n_kv_ * head_dim_ + 2 * (size_t) n_embd_); }
     float* past_k(const Slot& s) const { return s.past; }
     float* past_v(const Slot& s) const { return s.past + (size_t) (taps_ - 1) * n_kv_ * head_dim_; }
@@ -224,6 +230,18 @@ private:
                        : (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     }
     int pass_ = 0;   ///< the core's pass the call under way is in
+    // LoopCD (arXiv 2610.02185; capy-flash's --loopcd adaptive), STRATA_LOOPCD=<omega>: after the main coda the coda's
+    // layers run again, with slots of their own, on the state after the core's first pass (the model with one pass),
+    // and the logits become z + w (z - z1), w = omega (1 - (p1 - p2)) from the two largest probabilities of z
+    // (STRATA_LOOPCD_FIXED=1: w = omega).  STRATA_LOOPCD_SHOW=1 gives z1 itself (tests).
+    static constexpr int kRefRows = 5;   ///< pass 0's block 2 and stream; the main coda's blocks 2 and 3 and stream
+    bool lcd_ = false, lcd_adaptive_ = true, lcd_show_ = false;
+    float lcd_w_ = 0.f;
+    bool ref_ = false;                      ///< the reference coda's visit under way
+    float* lref_[kRefRows] = {};
+    float* lref_h_ = nullptr;               ///< the reference readout's normed rows (output_rows())
+    float* lref_lg_ = nullptr;              ///< its logits, lref_lg_rows_ rows at a time
+    int lref_lg_rows_ = 0, lref_rows_ = 0;  ///< lref_rows_: the rows output_rows() left in lref_h_
     // The DSpark drafter (--draft-model, a file of architecture dflash): three dense layers over a block of the
     // anchor token and mask rows, reading keys and values made from four of the target's features of every position
     // it ran (the inputs of three layer runs and the final normed state), then a recurrent Markov head over the
@@ -269,7 +287,7 @@ private:
     // device scratch, a row a token
     float* bl_[kBlocks] = {};   ///< the residual streams the blocks started from
     float *bank_ = nullptr, *bank_out_ = nullptr;
-    float* home_[kBlocks + 2] = {};   ///< bl_, bank_ and bank_out_ in the scratch, where carry_at(nullptr) puts them
+    float* home_[kBlocks + 2 + 5] = {};   ///< bl_, bank_ and bank_out_ in the scratch, where carry_at(nullptr) puts them
     void save_slots(int il, int pass, int64_t pos, uint8_t* dst);
     float* in_[3] = {};
     float* xin_[3] = {};
