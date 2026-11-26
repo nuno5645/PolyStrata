@@ -13,6 +13,7 @@
 // the one the caller holds: it runs its layers, hands the rows of the residual on to the next one through host
 // memory, and the next one goes on from them.
 #pragma once
+#include <cstdlib>
 
 #include "cpu_experts.hpp"
 #include "profile.hpp"
@@ -398,7 +399,17 @@ public:
     /// call, and the calls after it return them, whatever guess they are given.  It does so only while the card holds
     /// every expert: the block runs the whole model, and with experts on the CPU it cost more than its right guesses
     /// saved (Clover on an 8 GB laptop wrote 57.7 tokens/s after a 32K prompt with its guesses, 61.6 without).
-    bool drafts() const { return next_ ? next_->drafts() : draft_ || (block_guess_ && all_cached()); }
+    // STRATA_BLOCKS_ANYWAY=1: the block guesses with experts outside VRAM too (the policy still measures whether they pay)
+    static bool blocks_anyway() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_BLOCKS_ANYWAY");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    bool drafts() const {
+        return next_ ? next_->drafts() : draft_ || (block_guess_ && (all_cached() || blocks_anyway()));
+    }
     /// The guesses of a window come out of draft(token, 0, &p) together: asking for one more costs nothing.
     bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_; }
     /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
